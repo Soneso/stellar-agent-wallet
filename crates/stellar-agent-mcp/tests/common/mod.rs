@@ -202,6 +202,57 @@ pub fn install_test_audit_key(profile: &mut stellar_agent_core::profile::schema:
         .expect("set_password for audit key");
 }
 
+/// Installs the test audit key and audit log directory for `profile`, naming
+/// `case_label` in any setup panic.
+///
+/// # Panics
+///
+/// Panics if the mock keyring store, temporary directory, or keyring write
+/// fails.
+#[allow(
+    dead_code,
+    clippy::panic,
+    reason = "shared across integration-test binaries; setup failures name the table case"
+)]
+pub fn install_test_audit_key_for(
+    profile: &mut stellar_agent_core::profile::schema::Profile,
+    case_label: &str,
+) {
+    use base64::Engine as _;
+
+    let store = keyring_core::get_default_store().unwrap_or_else(|| {
+        panic!("case {case_label}: a mock keyring store is installed");
+    });
+    let mut dirs = TEST_AUDIT_LOG_DIRS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let same_store = dirs
+        .last()
+        .is_some_and(|(current, _)| Arc::ptr_eq(current, &store));
+    if !same_store {
+        stellar_agent_core::audit_log::AuditWriterRegistry::remove_for_test(
+            &stellar_agent_core::profile::name::profile_name_for_approval(profile),
+        );
+        let dir = tempfile::tempdir()
+            .unwrap_or_else(|e| panic!("case {case_label}: tempdir for audit log: {e}"));
+        dirs.push((store, dir));
+    }
+    let (_, dir) = dirs
+        .last()
+        .unwrap_or_else(|| panic!("case {case_label}: a current audit log directory"));
+    profile.audit_log_path = dir
+        .path()
+        .join(format!("{}.jsonl", profile.mcp_signer_default.account));
+    drop(dirs);
+
+    let key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(TEST_AUDIT_KEY_BYTES);
+    let coord = &profile.audit_log_hash_chain_key_id;
+    keyring_core::Entry::new(&coord.service, &coord.account)
+        .unwrap_or_else(|e| panic!("case {case_label}: Entry::new for audit key: {e}"))
+        .set_password(&key_b64)
+        .unwrap_or_else(|e| panic!("case {case_label}: set_password for audit key: {e}"));
+}
+
 /// Asserts the shared business-error envelope invariants on a tool result and
 /// returns `(code, message, full_text)` for further per-test assertions.
 ///
@@ -244,6 +295,58 @@ pub fn assert_business_envelope(result: &CallToolResult) -> (String, String, Str
     assert!(
         value["request_id"].as_str().is_some_and(|s| !s.is_empty()),
         "business-error envelope must carry a non-empty request_id: {value}"
+    );
+    let code = value["error"]["code"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let message = value["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    (code, message, text)
+}
+
+/// Asserts the shared business-error envelope invariants on `result` and names
+/// `case_label` in every failure message.
+#[must_use]
+#[allow(
+    dead_code,
+    reason = "shared across integration-test binaries; unused in some"
+)]
+pub fn assert_business_envelope_for(
+    result: &CallToolResult,
+    case_label: &str,
+) -> (String, String, String) {
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "case {case_label}: business-error result must set is_error = true"
+    );
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone());
+    assert!(
+        text.is_some(),
+        "case {case_label}: business-error result must carry a text content block"
+    );
+    let text = text.unwrap_or_default();
+    let parsed: Result<serde_json::Value, _> = serde_json::from_str(&text);
+    assert!(
+        parsed.is_ok(),
+        "case {case_label}: business-error content must be JSON: {parsed:?}"
+    );
+    let value = parsed.unwrap_or(serde_json::Value::Null);
+    assert_eq!(
+        value["ok"],
+        serde_json::json!(false),
+        "case {case_label}: business-error envelope must have ok:false: {value}"
+    );
+    assert!(
+        value["request_id"].as_str().is_some_and(|s| !s.is_empty()),
+        "case {case_label}: business-error envelope must carry a non-empty request_id: {value}"
     );
     let code = value["error"]["code"]
         .as_str()
@@ -343,6 +446,34 @@ pub fn isolated_data_root() -> IsolatedDataRoot {
             .join(stellar_agent_test_support::sandbox::MARKER)
             .is_file(),
         "owned wallet root is marked before the home guard"
+    );
+    let guard = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+    IsolatedDataRoot {
+        _dir: dir,
+        _guard: guard,
+    }
+}
+
+/// Installs a fresh data root for the lifetime of the returned guard, naming
+/// `case_label` in any setup panic or assertion failure.
+///
+/// # Panics
+///
+/// Panics if the temporary directory cannot be created or is unmarked.
+#[must_use]
+#[allow(
+    dead_code,
+    clippy::panic,
+    reason = "shared across integration-test binaries; setup failures name the table case"
+)]
+pub fn isolated_data_root_for(case_label: &str) -> IsolatedDataRoot {
+    let dir = stellar_agent_test_support::sandbox::StateSandbox::new()
+        .unwrap_or_else(|e| panic!("case {case_label}: temporary data root: {e}"));
+    assert!(
+        dir.path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "case {case_label}: owned wallet root is marked before the home guard"
     );
     let guard = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
     IsolatedDataRoot {
@@ -753,6 +884,31 @@ pub async fn received_methods(server: &wiremock::MockServer) -> Vec<String> {
         .collect()
 }
 
+/// Returns the JSON-RPC methods `server` received in order, naming `case_label`
+/// if request recording is disabled.
+///
+/// # Panics
+///
+/// Panics if request recording is disabled on `server`.
+#[allow(
+    dead_code,
+    clippy::panic,
+    reason = "shared across integration-test binaries; helper failures name the table case"
+)]
+pub async fn received_methods_for(server: &wiremock::MockServer, case_label: &str) -> Vec<String> {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_else(|| panic!("case {case_label}: request recording is enabled"))
+        .iter()
+        .filter_map(|request| {
+            serde_json::from_slice::<serde_json::Value>(&request.body)
+                .ok()
+                .and_then(|body| body["method"].as_str().map(str::to_owned))
+        })
+        .collect()
+}
+
 /// How many `StellarRpcClient` values `call` builds on this thread.
 ///
 /// The tool tests run on a current-thread runtime, so every client a tool
@@ -836,6 +992,59 @@ pub fn store_named_signer_identity(name: &str, service: &str, account: &str, see
     .expect("the identity record is written");
 }
 
+/// Stores the signer identity record beside the signer seed, naming
+/// `case_label` in any setup panic.
+///
+/// # Panics
+///
+/// Panics if the record cannot be rendered or written.
+#[allow(
+    dead_code,
+    reason = "shared across integration-test binaries; unused in some"
+)]
+pub fn store_signer_identity_for(service: &str, account: &str, seed: [u8; 32], case_label: &str) {
+    store_named_signer_identity_for(account, service, account, seed, case_label);
+}
+
+/// [`store_signer_identity_for`] for an explicitly named profile.
+///
+/// # Panics
+///
+/// Panics if the record cannot be rendered or written.
+#[allow(
+    dead_code,
+    clippy::panic,
+    reason = "shared across integration-test binaries; setup failures name the table case"
+)]
+pub fn store_named_signer_identity_for(
+    name: &str,
+    service: &str,
+    account: &str,
+    seed: [u8; 32],
+    case_label: &str,
+) {
+    use stellar_agent_core::profile::{
+        caip2::Caip2,
+        schema::{KeyringEntryRef, signer_identity_entry_ref},
+        signer_identity::SignerIdentityRecord,
+    };
+    let record = SignerIdentityRecord::agent(
+        ed25519_dalek::SigningKey::from_bytes(&seed)
+            .verifying_key()
+            .to_bytes(),
+        name,
+        Caip2::Testnet,
+    );
+    let rendered = record
+        .render()
+        .unwrap_or_else(|e| panic!("case {case_label}: an agent record renders: {e}"));
+    stellar_agent_network::keyring::write_keyring_string(
+        &signer_identity_entry_ref(&KeyringEntryRef::new(service, account)),
+        &rendered,
+    )
+    .unwrap_or_else(|e| panic!("case {case_label}: the identity record is written: {e}"));
+}
+
 /// A testnet profile with the `Noop` engine under `account`, with the test
 /// audit key installed.
 ///
@@ -858,6 +1067,32 @@ pub fn testnet_profile_for_account(
     .build();
     p.rpc_url = rpc_url.to_owned();
     install_test_audit_key(&mut p);
+    p
+}
+
+/// A testnet profile with the `Noop` engine under `account` and the test audit
+/// key installed, naming `case_label` in any setup panic.
+///
+/// # Panics
+///
+/// Panics if the test audit key cannot be installed.
+#[must_use]
+#[allow(
+    dead_code,
+    reason = "shared across integration-test binaries; unused in some"
+)]
+pub fn testnet_profile_for_account_for(
+    rpc_url: &str,
+    account: &str,
+    case_label: &str,
+) -> stellar_agent_core::profile::schema::Profile {
+    let mut p = stellar_agent_core::profile::schema::Profile::builder_testnet(
+        "svc", account, "n-svc", "n-acct",
+    )
+    .with_noop_engine()
+    .build();
+    p.rpc_url = rpc_url.to_owned();
+    install_test_audit_key_for(&mut p, case_label);
     p
 }
 
@@ -887,6 +1122,33 @@ pub fn timeout_profile(
     p
 }
 
+/// A one-second timeout profile under `account` with the test audit key
+/// installed, naming `case_label` in any setup panic.
+///
+/// # Panics
+///
+/// Panics if the test audit key cannot be installed.
+#[must_use]
+#[allow(
+    dead_code,
+    reason = "shared across integration-test binaries; unused in some"
+)]
+pub fn timeout_profile_for(
+    rpc_url: &str,
+    account: &str,
+    case_label: &str,
+) -> stellar_agent_core::profile::schema::Profile {
+    let mut p = stellar_agent_core::profile::schema::Profile::builder_testnet(
+        "svc", account, "n-svc", "n-acct",
+    )
+    .with_noop_engine()
+    .build();
+    p.rpc_url = rpc_url.to_owned();
+    p.submit_timeout_seconds = Some(1);
+    install_test_audit_key_for(&mut p, case_label);
+    p
+}
+
 /// Every audit row the profile's log holds.
 ///
 /// # Panics
@@ -904,6 +1166,32 @@ pub fn audit_rows(
     raw.lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| serde_json::from_str(line).expect("each audit row must be JSON"))
+        .collect()
+}
+
+/// Every audit row the profile's log holds, naming `case_label` if a line is
+/// not JSON.
+///
+/// # Panics
+///
+/// Panics if a line is not JSON.
+#[must_use]
+#[allow(
+    dead_code,
+    clippy::panic,
+    reason = "shared across integration-test binaries; parse failures name the table case"
+)]
+pub fn audit_rows_for(
+    profile: &stellar_agent_core::profile::schema::Profile,
+    case_label: &str,
+) -> Vec<serde_json::Value> {
+    let raw = std::fs::read_to_string(&profile.audit_log_path).unwrap_or_default();
+    raw.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("case {case_label}: each audit row must be JSON: {e}"))
+        })
         .collect()
 }
 
@@ -1036,6 +1324,35 @@ pub fn bind_rpc_credential(
             .expect("Entry::new for the RPC credential")
             .set_password(RPC_CREDENTIAL)
             .expect("set_password for the RPC credential");
+    }
+}
+
+/// Binds an RPC credential for `role` and optionally stores it in the mock
+/// keyring, naming `case_label` in any setup panic.
+///
+/// # Panics
+///
+/// Panics if storing the credential in the mock keyring fails.
+#[allow(
+    dead_code,
+    clippy::panic,
+    reason = "shared across integration-test binaries; setup failures name the table case"
+)]
+pub fn bind_rpc_credential_for(
+    profile: &mut stellar_agent_core::profile::schema::Profile,
+    role: stellar_agent_core::profile::schema::ProviderRole,
+    stored: bool,
+    case_label: &str,
+) {
+    bind_rpc_credential(profile, role, false);
+    if stored {
+        let entry = rpc_credential_entry(role);
+        keyring_core::Entry::new(&entry.service, &entry.account)
+            .unwrap_or_else(|e| panic!("case {case_label}: Entry::new for the RPC credential: {e}"))
+            .set_password(RPC_CREDENTIAL)
+            .unwrap_or_else(|e| {
+                panic!("case {case_label}: set_password for the RPC credential: {e}")
+            });
     }
 }
 

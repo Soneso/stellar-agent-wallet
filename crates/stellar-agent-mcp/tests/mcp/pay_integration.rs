@@ -5963,13 +5963,20 @@ async fn commit_endpoint_refusal_precedes_the_audit_preflight() {
 }
 
 fn witness_memo_entry() -> (String, String) {
+    witness_memo_entry_for("pay_prepare_makes_no_oracle_request")
+}
+
+fn witness_memo_entry_for(label: &str) -> (String, String) {
     use stellar_xdr::*;
     let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
         stellar_strkey::ed25519::PublicKey::from_string(DEST_G)
-            .unwrap()
+            .unwrap_or_else(|e| panic!("case {label}: DEST_G decode failed: {e}"))
             .0,
     )));
-    let name: String64 = b"config.memo_required".to_vec().try_into().unwrap();
+    let name: String64 = b"config.memo_required"
+        .to_vec()
+        .try_into()
+        .unwrap_or_else(|e| panic!("case {label}: memo data name encode failed: {e}"));
     let key = LedgerKey::Data(LedgerKeyData {
         account_id: account_id.clone(),
         data_name: name.clone(),
@@ -5977,25 +5984,34 @@ fn witness_memo_entry() -> (String, String) {
     let data = LedgerEntryData::Data(DataEntry {
         account_id,
         data_name: name,
-        data_value: b"1".to_vec().try_into().unwrap(),
+        data_value: b"1"
+            .to_vec()
+            .try_into()
+            .unwrap_or_else(|e| panic!("case {label}: memo data value encode failed: {e}")),
         ext: DataEntryExt::V0,
     });
     (
-        key.to_xdr_base64(Limits::none()).unwrap(),
-        data.to_xdr_base64(Limits::none()).unwrap(),
+        key.to_xdr_base64(Limits::none())
+            .unwrap_or_else(|e| panic!("case {label}: memo key XDR encode failed: {e}")),
+        data.to_xdr_base64(Limits::none())
+            .unwrap_or_else(|e| panic!("case {label}: memo data XDR encode failed: {e}")),
     )
 }
 
-fn witness_trustline_entry(source: &str) -> (String, String) {
-    witness_trustline_entry_with_balance(source, 100_000_000_000_000)
+fn witness_trustline_entry(label: &str, source: &str) -> (String, String) {
+    witness_trustline_entry_with_balance(label, source, 100_000_000_000_000)
 }
 
-fn witness_trustline_entry_with_balance(source: &str, balance: i64) -> (String, String) {
+fn witness_trustline_entry_with_balance(
+    label: &str,
+    source: &str,
+    balance: i64,
+) -> (String, String) {
     use stellar_xdr::*;
     let id = |g: &str| {
         AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
             stellar_strkey::ed25519::PublicKey::from_string(g)
-                .unwrap()
+                .unwrap_or_else(|e| panic!("case {label}: G-strkey decode failed: {e}"))
                 .0,
         )))
     };
@@ -6016,12 +6032,19 @@ fn witness_trustline_entry_with_balance(source: &str, balance: i64) -> (String, 
         ext: TrustLineEntryExt::V0,
     });
     (
-        key.to_xdr_base64(Limits::none()).unwrap(),
-        data.to_xdr_base64(Limits::none()).unwrap(),
+        key.to_xdr_base64(Limits::none())
+            .unwrap_or_else(|e| panic!("case {label}: trustline key XDR encode failed: {e}")),
+        data.to_xdr_base64(Limits::none())
+            .unwrap_or_else(|e| panic!("case {label}: trustline data XDR encode failed: {e}")),
     )
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one scenario table drives every payment commit witness case"
+)]
 async fn witness_payment_case(
+    label: &str,
     amount: &str,
     memo: bool,
     credit: bool,
@@ -6029,8 +6052,9 @@ async fn witness_payment_case(
     mode: &str,
     expected: &str,
 ) {
+    use base64::Engine as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    let _data_root = crate::common::isolated_data_root();
+    let _data_root = crate::common::isolated_data_root_for(label);
     // The profile's own signer account gives it an audit log no other test
     // writes, so the row counts below are the rows this commit appended.
     let account = crate::common::own_signer_account("witness-pay");
@@ -6043,21 +6067,25 @@ async fn witness_payment_case(
             count.fetch_add(1, Ordering::SeqCst);
         }),
     )])
-    .unwrap();
-    install_test_nonce_key(244);
+    .unwrap_or_else(|e| panic!("case {label}: install_with_read_hooks failed: {e}"));
+    let nonce_key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([244_u8; 32]);
+    keyring_core::Entry::new("n-svc", "n-acct")
+        .unwrap_or_else(|e| panic!("case {label}: nonce Entry::new failed: {e}"))
+        .set_password(&nonce_key_b64)
+        .unwrap_or_else(|e| panic!("case {label}: nonce set_password failed: {e}"));
     let seed = [0x74; 32];
     let source = gstrkey_for_seed(seed);
     keyring_core::Entry::new("svc", &account)
-        .unwrap()
+        .unwrap_or_else(|e| panic!("case {label}: signer Entry::new failed: {e}"))
         .set_password(&sstrkey_for_seed(seed))
-        .unwrap();
-    crate::common::store_signer_identity("svc", &account, seed);
+        .unwrap_or_else(|e| panic!("case {label}: signer set_password failed: {e}"));
+    crate::common::store_signer_identity_for("svc", &account, seed, label);
     let mut entries = vec![(
         account_ledger_key_xdr(&source),
         account_entry_xdr_with_balance(&source, 100_000_000_000_000),
     )];
     if credit {
-        entries.push(witness_trustline_entry(&source));
+        entries.push(witness_trustline_entry(label, &source));
     }
     let primary = MockServer::start().await;
     Mock::given(method("POST"))
@@ -6069,10 +6097,10 @@ async fn witness_payment_case(
         entries[0].1 = account_entry_xdr_with_seq(&source, 100_000_000_000_000, 0, 999);
     }
     if mode == "memo" {
-        entries.push(witness_memo_entry());
+        entries.push(witness_memo_entry_for(label));
     }
     if mode == "trustline" {
-        entries[1] = witness_trustline_entry_with_balance(&source, 100_000_000_000_001);
+        entries[1] = witness_trustline_entry_with_balance(label, &source, 100_000_000_000_001);
     }
     let identity = if mode == "identity" {
         crate::common::EndpointNetwork::reporting("hostile-identity-marker")
@@ -6092,13 +6120,20 @@ async fn witness_payment_case(
             .mount(&oracle)
             .await;
     }
-    let mut profile = crate::common::testnet_profile_for_account(&primary.uri(), &account);
+    let mut profile =
+        crate::common::testnet_profile_for_account_for(&primary.uri(), &account, label);
     profile.oracle_provider_url = if mode == "none" {
         None
     } else if mode == "construction" {
-        Some(url::Url::parse("ftp://oracle.example").unwrap())
+        Some(
+            url::Url::parse("ftp://oracle.example")
+                .unwrap_or_else(|e| panic!("case {label}: oracle URL parse failed: {e}")),
+        )
     } else {
-        Some(url::Url::parse(&oracle.uri()).unwrap())
+        Some(
+            url::Url::parse(&oracle.uri())
+                .unwrap_or_else(|e| panic!("case {label}: oracle URI parse failed: {e}")),
+        )
     };
     let asset = format!("USD:{DEST_G}");
     if threshold {
@@ -6106,27 +6141,84 @@ async fn witness_payment_case(
             stellar_agent_core::cross_check::CrossCheckThresholds::new(
                 [(
                     stellar_agent_core::asset_id::CanonicalAsset::parse_threshold_key(&asset)
-                        .unwrap(),
-                    amount.parse().unwrap(),
+                        .unwrap_or_else(|e| {
+                            panic!("case {label}: parse_threshold_key failed: {e}")
+                        }),
+                    amount
+                        .parse()
+                        .unwrap_or_else(|e| panic!("case {label}: threshold amount parse: {e}")),
                 )]
                 .into_iter()
                 .collect(),
             )
-            .unwrap();
+            .unwrap_or_else(|e| panic!("case {label}: CrossCheckThresholds::new failed: {e}"));
     }
-    let server = WalletServer::new(profile.clone()).unwrap();
+    let server = WalletServer::new(profile.clone())
+        .unwrap_or_else(|e| panic!("case {label}: WalletServer::new failed: {e}"));
     let mut args = pay_args(&source, amount);
     if memo {
-        args.memo_text = Some(serde_json::from_value(serde_json::json!("invoice")).unwrap());
+        args.memo_text = Some(
+            serde_json::from_value(serde_json::json!("invoice"))
+                .unwrap_or_else(|e| panic!("case {label}: memo_text deserialize failed: {e}")),
+        );
     }
     if credit {
         args.asset = asset;
     }
-    let simulated = server.call_stellar_pay(args.clone()).await.unwrap();
-    assert!(crate::common::received_methods(&oracle).await.is_empty());
-    let commit = simulated_commit_args(&simulated, &args);
+    let simulated = server
+        .call_stellar_pay(args.clone())
+        .await
+        .unwrap_or_else(|e| panic!("case {label}: call_stellar_pay failed: {e}"));
+    assert!(
+        crate::common::received_methods_for(&oracle, label)
+            .await
+            .is_empty(),
+        "case {label}: prepare must not contact oracle"
+    );
+    let sim_json: serde_json::Value = serde_json::from_str(call_result_text(&simulated))
+        .unwrap_or_else(|e| panic!("case {label}: simulate result must be JSON: {e}"));
+    assert_ne!(
+        simulated.is_error,
+        Some(true),
+        "case {label}: simulate must succeed: {sim_json}"
+    );
+    let sim_data = sim_json
+        .get("data")
+        .unwrap_or_else(|| panic!("case {label}: simulate carries data: {sim_json}"));
+    let commit = StellarPayCommitArgs {
+        chain_id: args.chain_id.clone(),
+        source: args.source.clone(),
+        destination: args.destination.clone(),
+        amount: args.amount.clone(),
+        amount_in_stroops: args.amount_in_stroops.clone(),
+        asset: args.asset.clone(),
+        memo_text: args.memo_text.clone(),
+        memo_id: args.memo_id,
+        memo_hash_hex: args.memo_hash_hex.clone(),
+        memo_return_hex: args.memo_return_hex.clone(),
+        nonce: Some(
+            sim_data["nonce"]
+                .as_str()
+                .unwrap_or_else(|| panic!("case {label}: missing simulate nonce"))
+                .to_owned(),
+        ),
+        expires_at_unix_ms: Some(
+            sim_data["expires_at_unix_ms"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("case {label}: missing simulate expires_at_unix_ms")),
+        ),
+        envelope_xdr: Some(
+            sim_data["envelope_xdr"]
+                .as_str()
+                .unwrap_or_else(|| panic!("case {label}: missing simulate envelope_xdr"))
+                .to_owned(),
+        ),
+        approval_nonce: None,
+        approval_attestation: None,
+        business_id: None,
+    };
     if mode == "primary_memo" {
-        let memo_entry = witness_memo_entry();
+        let memo_entry = witness_memo_entry_for(label);
         Mock::given(method("POST"))
             .and(wiremock::matchers::body_partial_json(serde_json::json!({
                 "method": "getLedgerEntries", "params": {"keys": [memo_entry.0.clone()]}})))
@@ -6150,82 +6242,121 @@ async fn witness_payment_case(
     let server = if mode == "cap" {
         let mut capped = profile.clone();
         capped.classic_max_fee_per_op_stroops = Some(50);
-        WalletServer::new(capped).unwrap()
+        WalletServer::new(capped)
+            .unwrap_or_else(|e| panic!("case {label}: capped WalletServer::new failed: {e}"))
     } else {
         server
     };
     let before = reads.load(Ordering::SeqCst);
-    let result = server.call_stellar_pay_commit(commit).await.unwrap();
-    let body = call_result_json(&result);
+    let result = server
+        .call_stellar_pay_commit(commit)
+        .await
+        .unwrap_or_else(|e| panic!("case {label}: call_stellar_pay_commit failed: {e}"));
+    let body: serde_json::Value = serde_json::from_str(call_result_text(&result))
+        .unwrap_or_else(|e| panic!("case {label}: commit result must be JSON: {e}"));
     if expected.contains('.') {
-        let (code, text, _) = crate::common::assert_business_envelope(&result);
-        assert_eq!(code, expected, "{body}");
+        let (code, text, _) = crate::common::assert_business_envelope_for(&result, label);
+        assert_eq!(code, expected, "case {label}: {body}");
         assert_eq!(
             reads.load(Ordering::SeqCst),
             before,
-            "refusal must precede signer access"
+            "case {label}: refusal must precede signer access"
         );
         assert!(
-            !crate::common::received_methods(&primary)
+            !crate::common::received_methods_for(&primary, label)
                 .await
                 .iter()
-                .any(|m| m == "sendTransaction")
+                .any(|m| m == "sendTransaction"),
+            "case {label}: refused commit must not send"
         );
-        assert!(!text.contains("hostile-identity-marker"));
+        assert!(
+            !text.contains("hostile-identity-marker"),
+            "case {label}: {text}"
+        );
         if mode == "cap" {
             assert_eq!(
                 text,
                 "the envelope's per-operation fee 100 stroops exceeds the profile cap of 50 \
-                 stroops; prepare the transaction again with a fee within the cap"
+                 stroops; prepare the transaction again with a fee within the cap",
+                "case {label}"
             );
         }
         if matches!(mode, "cap" | "destination_error") {
             assert!(
-                crate::common::received_methods(&oracle).await.is_empty(),
-                "the refusal precedes the witness"
+                crate::common::received_methods_for(&oracle, label)
+                    .await
+                    .is_empty(),
+                "case {label}: the refusal precedes the witness"
             );
         }
         return;
     }
-    assert_ne!(result.is_error, Some(true), "{body}");
-    assert_eq!(body["data"]["cross_check"]["status"], expected);
-    assert!(body["data"]["tx_hash"].is_string());
+    assert_ne!(result.is_error, Some(true), "case {label}: {body}");
+    assert_eq!(
+        body["data"]["cross_check"]["status"], expected,
+        "case {label}"
+    );
+    assert!(body["data"]["tx_hash"].is_string(), "case {label}: {body}");
     assert!(
-        crate::common::received_methods(&primary)
+        crate::common::received_methods_for(&primary, label)
             .await
             .iter()
-            .any(|m| m == "sendTransaction")
+            .any(|m| m == "sendTransaction"),
+        "case {label}: admitted commit must send"
     );
-    let rows = audit_rows(&profile);
+    let rows = crate::common::audit_rows_for(&profile, label);
     for kind in ["value_action_pending", "value_action_submitted"] {
         if kind == "value_action_submitted" {
-            assert!(rows.iter().all(|row| row["kind"] != kind));
+            assert!(
+                rows.iter().all(|row| row["kind"] != kind),
+                "case {label}: unexpected {kind} row: {rows:?}"
+            );
             continue;
         }
         let rows = rows_of_kind(&rows, kind);
-        assert_eq!(rows.len(), 1, "{kind}: {rows:?}");
+        assert_eq!(rows.len(), 1, "case {label}: {kind}: {rows:?}");
         if expected == "passed" {
-            assert_eq!(rows[0]["witness"]["provider"], oracle.uri());
-            assert_eq!(rows[0]["witness"]["ledger"], 1001);
+            assert_eq!(rows[0]["witness"]["provider"], oracle.uri(), "case {label}");
+            assert_eq!(rows[0]["witness"]["ledger"], 1001, "case {label}");
             assert_eq!(
-                rows[0]["witness"]["inputs_digest"].as_str().unwrap().len(),
-                64
+                rows[0]["witness"]["inputs_digest"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("case {label}: missing witness inputs_digest"))
+                    .len(),
+                64,
+                "case {label}"
             );
-            assert_eq!(rows[0]["witness"]["kinds"][0], "source_account");
+            assert_eq!(
+                rows[0]["witness"]["kinds"][0], "source_account",
+                "case {label}"
+            );
         } else {
-            assert!(rows[0].get("witness").is_none());
+            assert!(rows[0].get("witness").is_none(), "case {label}: {rows:?}");
         }
     }
     if expected == "passed" {
-        assert_eq!(body["data"]["cross_check"]["provider"], oracle.uri());
-        assert_eq!(body["data"]["cross_check"]["ledger"], 1001);
         assert_eq!(
-            crate::common::received_methods(&oracle).await,
-            ["getNetwork", "getLedgerEntries"]
+            body["data"]["cross_check"]["provider"],
+            oracle.uri(),
+            "case {label}"
         );
-        assert!(rows_of_kind(&rows, "value_action_submitted").is_empty());
+        assert_eq!(body["data"]["cross_check"]["ledger"], 1001, "case {label}");
+        assert_eq!(
+            crate::common::received_methods_for(&oracle, label).await,
+            ["getNetwork", "getLedgerEntries"],
+            "case {label}"
+        );
+        assert!(
+            rows_of_kind(&rows, "value_action_submitted").is_empty(),
+            "case {label}"
+        );
     } else {
-        assert!(crate::common::received_methods(&oracle).await.is_empty());
+        assert!(
+            crate::common::received_methods_for(&oracle, label)
+                .await
+                .is_empty(),
+            "case {label}: skipped or not-required witness must not contact oracle"
+        );
         assert_eq!(
             body["data"]["cross_check"]["reason"],
             if expected == "not_required" {
@@ -6234,15 +6365,10 @@ async fn witness_payment_case(
                 "no_threshold_for_asset"
             } else {
                 "oracle_not_configured"
-            }
+            },
+            "case {label}"
         );
     }
-}
-
-#[tokio::test]
-#[serial]
-async fn pay_commit_rows_carry_witness() {
-    witness_payment_case("20000000000", false, false, false, "match", "passed").await;
 }
 
 /// A memo-less prepare reads the destination's SEP-29 flag on the primary and
@@ -6330,164 +6456,159 @@ async fn pay_prepare_makes_no_oracle_request() {
     );
 }
 
+/// Payment commits enforce cross-check thresholds, witness divergence, memo
+/// checks, fee caps, and oracle transport failures before signer access.
 #[tokio::test]
 #[serial]
-async fn pay_commit_memoless_below_threshold_with_oracle_passes() {
-    witness_payment_case("10000000", false, false, false, "match", "passed").await;
-}
+async fn pay_commit_witness_cases() {
+    const CASES: [(&str, &str, bool, bool, bool, &str, &str); 16] = [
+        (
+            "commit_rows_carry_witness",
+            "20000000000",
+            false,
+            false,
+            false,
+            "match",
+            "passed",
+        ),
+        (
+            "memoless_below_threshold_with_oracle_passes",
+            "10000000",
+            false,
+            false,
+            false,
+            "match",
+            "passed",
+        ),
+        (
+            "with_memo_below_threshold_is_not_required",
+            "9990000000",
+            true,
+            false,
+            false,
+            "match",
+            "not_required",
+        ),
+        (
+            "memoless_credit_without_threshold_passes_on_testnet",
+            "10000000",
+            false,
+            true,
+            false,
+            "match",
+            "passed",
+        ),
+        (
+            "with_memo_credit_without_threshold_skips_on_testnet",
+            "10000000",
+            true,
+            true,
+            false,
+            "match",
+            "skipped",
+        ),
+        (
+            "credit_at_threshold_requires_witness",
+            "10000000",
+            true,
+            true,
+            true,
+            "match",
+            "passed",
+        ),
+        (
+            "without_oracle_skips_on_testnet",
+            "20000000000",
+            false,
+            false,
+            false,
+            "none",
+            "skipped",
+        ),
+        (
+            "source_disagreement_refuses_simulation_divergence",
+            "20000000000",
+            false,
+            false,
+            false,
+            "source",
+            "simulation.divergence",
+        ),
+        (
+            "memo_flag_disagreement_is_rpc_divergence",
+            "10000000",
+            false,
+            false,
+            false,
+            "memo",
+            "network.rpc_divergence",
+        ),
+        (
+            "memo_required_refuses_at_commit",
+            "10000000",
+            false,
+            false,
+            false,
+            "primary_memo",
+            "validation.memo_required",
+        ),
+        (
+            "oracle_identity_refusal_is_witness_unavailable",
+            "20000000000",
+            false,
+            false,
+            false,
+            "identity",
+            "network.witness_unavailable",
+        ),
+        (
+            "oracle_construction_failure_is_witness_unavailable",
+            "20000000000",
+            false,
+            false,
+            false,
+            "construction",
+            "network.witness_unavailable",
+        ),
+        (
+            "source_trustline_disagreement_refuses",
+            "10000000",
+            false,
+            true,
+            false,
+            "trustline",
+            "simulation.divergence",
+        ),
+        (
+            "fee_above_cap_refuses_before_the_witness",
+            "20000000000",
+            false,
+            false,
+            false,
+            "cap",
+            "fees.percentile_exceeds_cap",
+        ),
+        (
+            "destination_read_error_refuses_with_its_code",
+            "20000000000",
+            false,
+            false,
+            false,
+            "destination_error",
+            "network.rpc_unreachable",
+        ),
+        (
+            "oracle_401_keeps_credential_code",
+            "20000000000",
+            false,
+            false,
+            false,
+            "401",
+            "network.rpc_credential_refused",
+        ),
+    ];
 
-#[tokio::test]
-#[serial]
-async fn pay_commit_with_memo_below_threshold_is_not_required() {
-    witness_payment_case("9990000000", true, false, false, "match", "not_required").await;
-}
-
-#[tokio::test]
-#[serial]
-async fn pay_commit_memoless_credit_without_threshold_passes_on_testnet() {
-    witness_payment_case("10000000", false, true, false, "match", "passed").await;
-}
-
-#[tokio::test]
-#[serial]
-async fn pay_commit_with_memo_credit_without_threshold_skips_on_testnet() {
-    witness_payment_case("10000000", true, true, false, "match", "skipped").await;
-}
-
-#[tokio::test]
-#[serial]
-async fn pay_commit_credit_at_threshold_requires_witness() {
-    witness_payment_case("10000000", true, true, true, "match", "passed").await;
-}
-
-#[tokio::test]
-#[serial]
-async fn pay_commit_without_oracle_skips_on_testnet() {
-    witness_payment_case("20000000000", false, false, false, "none", "skipped").await;
-}
-
-#[tokio::test]
-#[serial]
-async fn pay_commit_source_disagreement_refuses_simulation_divergence() {
-    witness_payment_case(
-        "20000000000",
-        false,
-        false,
-        false,
-        "source",
-        "simulation.divergence",
-    )
-    .await;
-}
-
-#[tokio::test]
-#[serial]
-async fn pay_commit_memo_flag_disagreement_is_rpc_divergence() {
-    witness_payment_case(
-        "10000000",
-        false,
-        false,
-        false,
-        "memo",
-        "network.rpc_divergence",
-    )
-    .await;
-}
-
-#[tokio::test]
-#[serial]
-async fn pay_commit_memo_required_refuses_at_commit() {
-    witness_payment_case(
-        "10000000",
-        false,
-        false,
-        false,
-        "primary_memo",
-        "validation.memo_required",
-    )
-    .await;
-}
-
-#[tokio::test]
-#[serial]
-async fn pay_commit_oracle_identity_refusal_is_witness_unavailable() {
-    witness_payment_case(
-        "20000000000",
-        false,
-        false,
-        false,
-        "identity",
-        "network.witness_unavailable",
-    )
-    .await;
-}
-
-#[tokio::test]
-#[serial]
-async fn pay_commit_oracle_construction_failure_is_witness_unavailable() {
-    witness_payment_case(
-        "20000000000",
-        false,
-        false,
-        false,
-        "construction",
-        "network.witness_unavailable",
-    )
-    .await;
-}
-
-#[tokio::test]
-#[serial]
-async fn pay_commit_source_trustline_disagreement_refuses() {
-    witness_payment_case(
-        "10000000",
-        false,
-        true,
-        false,
-        "trustline",
-        "simulation.divergence",
-    )
-    .await;
-}
-
-#[tokio::test]
-#[serial]
-async fn pay_commit_fee_above_cap_refuses_before_the_witness() {
-    witness_payment_case(
-        "20000000000",
-        false,
-        false,
-        false,
-        "cap",
-        "fees.percentile_exceeds_cap",
-    )
-    .await;
-}
-
-#[tokio::test]
-#[serial]
-async fn pay_commit_destination_read_error_refuses_with_its_code() {
-    witness_payment_case(
-        "20000000000",
-        false,
-        false,
-        false,
-        "destination_error",
-        "network.rpc_unreachable",
-    )
-    .await;
-}
-
-#[tokio::test]
-#[serial]
-async fn pay_commit_oracle_401_keeps_credential_code() {
-    witness_payment_case(
-        "20000000000",
-        false,
-        false,
-        false,
-        "401",
-        "network.rpc_credential_refused",
-    )
-    .await;
+    for (label, amount, memo, credit, threshold, mode, expected) in CASES {
+        witness_payment_case(label, amount, memo, credit, threshold, mode, expected).await;
+    }
 }

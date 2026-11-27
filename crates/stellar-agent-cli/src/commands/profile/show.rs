@@ -177,28 +177,44 @@ mod tests {
         );
     }
 
+    /// Accepts a positional profile name or `--profile`, and rejects both or neither.
     #[test]
-    fn positional_name_is_accepted() {
-        let w = Wrap::try_parse_from(["prog", "acme"]).expect("positional parses");
-        assert_eq!(w.args.profile_name(), "acme");
-    }
+    fn profile_selector_accepts_positional_or_flag_and_rejects_conflict_or_missing() {
+        let cases: [(&str, &[&str], Result<&str, ErrorKind>); 4] = [
+            ("positional_name", &["prog", "acme"], Ok("acme")),
+            ("profile_flag", &["prog", "--profile", "acme"], Ok("acme")),
+            (
+                "both_positional_and_flag",
+                &["prog", "acme", "--profile", "other"],
+                Err(ErrorKind::ArgumentConflict),
+            ),
+            (
+                "neither_positional_nor_flag",
+                &["prog"],
+                Err(ErrorKind::MissingRequiredArgument),
+            ),
+        ];
 
-    #[test]
-    fn profile_flag_is_accepted() {
-        let w = Wrap::try_parse_from(["prog", "--profile", "acme"]).expect("flag parses");
-        assert_eq!(w.args.profile_name(), "acme");
-    }
-
-    #[test]
-    fn both_positional_and_flag_is_a_conflict() {
-        let err = Wrap::try_parse_from(["prog", "acme", "--profile", "other"]).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
-    }
-
-    #[test]
-    fn neither_positional_nor_flag_is_missing_required() {
-        let err = Wrap::try_parse_from(["prog"]).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
+        for (name, argv, expected) in cases {
+            let parsed = Wrap::try_parse_from(argv);
+            match expected {
+                Ok(want) => {
+                    assert!(parsed.is_ok(), "case {name}: parse failed: {parsed:?}");
+                    if let Ok(w) = parsed {
+                        assert_eq!(w.args.profile_name(), want, "case {name}");
+                    }
+                }
+                Err(want_kind) => {
+                    assert!(
+                        parsed.is_err(),
+                        "case {name}: expected {want_kind:?}: {parsed:?}"
+                    );
+                    if let Err(err) = parsed {
+                        assert_eq!(err.kind(), want_kind, "case {name}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

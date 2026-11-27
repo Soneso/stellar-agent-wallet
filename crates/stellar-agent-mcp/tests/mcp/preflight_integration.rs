@@ -100,12 +100,20 @@ fn assert_tool_error(
     result: Result<rmcp::model::CallToolResult, rmcp::ErrorData>,
     code_substr: &str,
 ) {
+    assert_tool_error_for("single", result, code_substr);
+}
+
+fn assert_tool_error_for(
+    case: &str,
+    result: Result<rmcp::model::CallToolResult, rmcp::ErrorData>,
+    code_substr: &str,
+) {
     match result {
         Ok(tool_result) => {
             assert_eq!(
                 tool_result.is_error,
                 Some(true),
-                "expected is_error=true, got is_error={:?}",
+                "case {case}: expected is_error=true, got is_error={:?}",
                 tool_result.is_error
             );
             let json_str = tool_result
@@ -116,11 +124,11 @@ fn assert_tool_error(
                 .unwrap_or("");
             assert!(
                 json_str.contains(code_substr),
-                "response must contain '{code_substr}', got: {json_str}"
+                "case {case}: response must contain '{code_substr}', got: {json_str}"
             );
         }
         Err(err) => {
-            panic!("expected Ok(is_error=true), got Err: {err}");
+            panic!("case {case}: expected Ok(is_error=true), got Err: {err}");
         }
     }
 }
@@ -128,12 +136,19 @@ fn assert_tool_error(
 /// Checks that a tool result is a success (no `is_error=true`) and contains
 /// `envelope_xdr` and `nonce`.
 fn assert_tool_success(result: Result<rmcp::model::CallToolResult, rmcp::ErrorData>) {
+    assert_tool_success_for("single", result);
+}
+
+fn assert_tool_success_for(
+    case: &str,
+    result: Result<rmcp::model::CallToolResult, rmcp::ErrorData>,
+) {
     match result {
         Ok(tool_result) => {
             assert_ne!(
                 tool_result.is_error,
                 Some(true),
-                "expected success, got is_error=true; content: {:?}",
+                "case {case}: expected success, got is_error=true; content: {:?}",
                 tool_result.content
             );
             let json_str = tool_result
@@ -144,15 +159,15 @@ fn assert_tool_success(result: Result<rmcp::model::CallToolResult, rmcp::ErrorDa
                 .unwrap_or("");
             assert!(
                 json_str.contains("envelope_xdr"),
-                "success response must contain envelope_xdr, got: {json_str}"
+                "case {case}: success response must contain envelope_xdr, got: {json_str}"
             );
             assert!(
                 json_str.contains("nonce"),
-                "success response must contain nonce, got: {json_str}"
+                "case {case}: success response must contain nonce, got: {json_str}"
             );
         }
         Err(err) => {
-            panic!("expected Ok(success), got Err: {err}");
+            panic!("case {case}: expected Ok(success), got Err: {err}");
         }
     }
 }
@@ -217,18 +232,28 @@ async fn run_create_account_preflight(
     subentry_count: u32,
     balance_stroops: i64,
 ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+    run_create_account_preflight_for("single", mock_server, subentry_count, balance_stroops).await
+}
+
+async fn run_create_account_preflight_for(
+    case: &str,
+    mock_server: &MockServer,
+    subentry_count: u32,
+    balance_stroops: i64,
+) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
     use base64::Engine;
     use keyring_core::Entry;
 
-    keyring_mock::install().expect("mock keyring store init");
+    keyring_mock::install()
+        .unwrap_or_else(|e| panic!("case {case}: mock keyring store init failed: {e}"));
 
     // Provide a nonce key so NonceMint::from_profile works.
     let nonce_key_bytes = [0u8; 32];
     let nonce_key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(nonce_key_bytes);
     Entry::new("n-svc", "n-acct")
-        .expect("Entry::new")
+        .unwrap_or_else(|e| panic!("case {case}: Entry::new failed: {e}"))
         .set_password(&nonce_key_b64)
-        .expect("set_password");
+        .unwrap_or_else(|e| panic!("case {case}: set_password failed: {e}"));
 
     let account_xdr = account_entry_xdr(SOURCE_G, balance_stroops, subentry_count);
     let key_xdr = account_ledger_key_xdr(SOURCE_G);
@@ -250,7 +275,8 @@ async fn run_create_account_preflight(
         .await;
 
     let profile = testnet_profile_with_rpc(&mock_server.uri());
-    let server = WalletServer::new(profile).expect("WalletServer::new");
+    let server = WalletServer::new(profile)
+        .unwrap_or_else(|e| panic!("case {case}: WalletServer::new failed: {e}"));
 
     server
         .call_stellar_create_account(StellarCreateAccountArgs {
@@ -258,134 +284,71 @@ async fn run_create_account_preflight(
             source: SOURCE_G.to_owned(),
             destination: DEST_G.to_owned(),
             // 1 XLM starting balance = 10_000_000 stroops.
-            starting_balance: serde_json::from_str(r#""1 XLM""#).unwrap(),
+            starting_balance: serde_json::from_str(r#""1 XLM""#)
+                .unwrap_or_else(|e| panic!("case {case}: starting_balance parse failed: {e}")),
             classic_base: None,
             business_id: None,
         })
         .await
 }
 
-/// subentry_count=0: balance = required - 1 triggers insufficient_balance.
+/// Checks `stellar_create_account` pre-flight reserve boundaries across
+/// subentry counts 0, 1, 5, and 25 at both `min_balance - 1` and `min_balance`.
 #[tokio::test]
 #[serial]
-async fn create_account_preflight_subentry0_insufficient() {
-    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-    let _storage_home =
-        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-    let mock_server = MockServer::start().await;
-    let fee = FEE_STROOPS;
-    let starting_balance = 10_000_000_i64;
-    let min_balance = create_account_min_balance(0, starting_balance, fee);
-    let result = run_create_account_preflight(&mock_server, 0, min_balance - 1).await;
-    assert_tool_error(result, "ledger.insufficient_balance");
-}
+async fn create_account_preflight_subentry_matrix() {
+    const CASES: [(&str, u32, i64, Option<&str>); 8] = [
+        (
+            "subentry0_insufficient",
+            0,
+            -1,
+            Some("ledger.insufficient_balance"),
+        ),
+        ("subentry0_sufficient", 0, 0, None),
+        (
+            "subentry1_insufficient",
+            1,
+            -1,
+            Some("ledger.insufficient_balance"),
+        ),
+        ("subentry1_sufficient", 1, 0, None),
+        (
+            "subentry5_insufficient",
+            5,
+            -1,
+            Some("ledger.insufficient_balance"),
+        ),
+        ("subentry5_sufficient", 5, 0, None),
+        (
+            "subentry25_insufficient",
+            25,
+            -1,
+            Some("ledger.insufficient_balance"),
+        ),
+        ("subentry25_sufficient", 25, 0, None),
+    ];
 
-/// subentry_count=0: balance = exact minimum passes.
-#[tokio::test]
-#[serial]
-async fn create_account_preflight_subentry0_sufficient() {
-    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-    let _storage_home =
-        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-    let mock_server = MockServer::start().await;
     let fee = FEE_STROOPS;
     let starting_balance = 10_000_000_i64;
-    let min_balance = create_account_min_balance(0, starting_balance, fee);
-    let result = run_create_account_preflight(&mock_server, 0, min_balance).await;
-    assert_tool_success(result);
-}
-
-/// subentry_count=1: balance = required - 1 triggers insufficient_balance.
-///
-/// Minimum increases by BASE_RESERVE_STROOPS compared to subentry_count=0
-/// because the source account needs an extra reserve unit for its 1 subentry.
-#[tokio::test]
-#[serial]
-async fn create_account_preflight_subentry1_insufficient() {
-    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-    let _storage_home =
-        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-    let mock_server = MockServer::start().await;
-    let fee = FEE_STROOPS;
-    let starting_balance = 10_000_000_i64;
-    let min_balance = create_account_min_balance(1, starting_balance, fee);
-    let result = run_create_account_preflight(&mock_server, 1, min_balance - 1).await;
-    assert_tool_error(result, "ledger.insufficient_balance");
-}
-
-/// subentry_count=1: balance = exact minimum passes.
-#[tokio::test]
-#[serial]
-async fn create_account_preflight_subentry1_sufficient() {
-    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-    let _storage_home =
-        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-    let mock_server = MockServer::start().await;
-    let fee = FEE_STROOPS;
-    let starting_balance = 10_000_000_i64;
-    let min_balance = create_account_min_balance(1, starting_balance, fee);
-    let result = run_create_account_preflight(&mock_server, 1, min_balance).await;
-    assert_tool_success(result);
-}
-
-/// subentry_count=5: balance = required - 1 triggers insufficient_balance.
-#[tokio::test]
-#[serial]
-async fn create_account_preflight_subentry5_insufficient() {
-    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-    let _storage_home =
-        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-    let mock_server = MockServer::start().await;
-    let fee = FEE_STROOPS;
-    let starting_balance = 10_000_000_i64;
-    let min_balance = create_account_min_balance(5, starting_balance, fee);
-    let result = run_create_account_preflight(&mock_server, 5, min_balance - 1).await;
-    assert_tool_error(result, "ledger.insufficient_balance");
-}
-
-/// subentry_count=5: balance = exact minimum passes.
-#[tokio::test]
-#[serial]
-async fn create_account_preflight_subentry5_sufficient() {
-    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-    let _storage_home =
-        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-    let mock_server = MockServer::start().await;
-    let fee = FEE_STROOPS;
-    let starting_balance = 10_000_000_i64;
-    let min_balance = create_account_min_balance(5, starting_balance, fee);
-    let result = run_create_account_preflight(&mock_server, 5, min_balance).await;
-    assert_tool_success(result);
-}
-
-/// subentry_count=25: balance = required - 1 triggers insufficient_balance.
-#[tokio::test]
-#[serial]
-async fn create_account_preflight_subentry25_insufficient() {
-    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-    let _storage_home =
-        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-    let mock_server = MockServer::start().await;
-    let fee = FEE_STROOPS;
-    let starting_balance = 10_000_000_i64;
-    let min_balance = create_account_min_balance(25, starting_balance, fee);
-    let result = run_create_account_preflight(&mock_server, 25, min_balance - 1).await;
-    assert_tool_error(result, "ledger.insufficient_balance");
-}
-
-/// subentry_count=25: balance = exact minimum passes.
-#[tokio::test]
-#[serial]
-async fn create_account_preflight_subentry25_sufficient() {
-    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-    let _storage_home =
-        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-    let mock_server = MockServer::start().await;
-    let fee = FEE_STROOPS;
-    let starting_balance = 10_000_000_i64;
-    let min_balance = create_account_min_balance(25, starting_balance, fee);
-    let result = run_create_account_preflight(&mock_server, 25, min_balance).await;
-    assert_tool_success(result);
+    for (case, subentry_count, delta, expected_error) in CASES {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new()
+            .unwrap_or_else(|e| panic!("case {case}: StateSandbox::new failed: {e}"));
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let mock_server = MockServer::start().await;
+        let min_balance = create_account_min_balance(subentry_count, starting_balance, fee);
+        let result = run_create_account_preflight_for(
+            case,
+            &mock_server,
+            subentry_count,
+            min_balance + delta,
+        )
+        .await;
+        match expected_error {
+            Some(code) => assert_tool_error_for(case, result, code),
+            None => assert_tool_success_for(case, result),
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -625,6 +588,7 @@ fn pay_native_min_balance(subentry_count: u32, amount: i64, fee: i64) -> i64 {
 }
 
 async fn run_pay_native_preflight(
+    case: &str,
     mock_server: &MockServer,
     subentry_count: u32,
     balance_stroops: i64,
@@ -633,13 +597,14 @@ async fn run_pay_native_preflight(
     use base64::Engine;
     use keyring_core::Entry;
 
-    keyring_mock::install().expect("mock keyring store init");
+    keyring_mock::install()
+        .unwrap_or_else(|e| panic!("case {case}: mock keyring store init failed: {e}"));
     let nonce_key_bytes = [10u8; 32];
     let nonce_key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(nonce_key_bytes);
     Entry::new("n-svc", "n-acct")
-        .expect("Entry::new")
+        .unwrap_or_else(|e| panic!("case {case}: Entry::new failed: {e}"))
         .set_password(&nonce_key_b64)
-        .expect("set_password");
+        .unwrap_or_else(|e| panic!("case {case}: set_password failed: {e}"));
 
     let account_xdr = account_entry_xdr(SOURCE_G, balance_stroops, subentry_count);
     let key_xdr = account_ledger_key_xdr(SOURCE_G);
@@ -674,14 +639,18 @@ async fn run_pay_native_preflight(
         .await;
 
     let profile = testnet_profile_with_rpc(&mock_server.uri());
-    let server = WalletServer::new(profile).expect("WalletServer::new");
+    let server = WalletServer::new(profile)
+        .unwrap_or_else(|e| panic!("case {case}: WalletServer::new failed: {e}"));
 
     server
         .call_stellar_pay(StellarPayArgs {
             chain_id: "stellar:testnet".to_owned(),
             source: SOURCE_G.to_owned(),
             destination: DEST_G.to_owned(),
-            amount: Some(serde_json::from_str(amount_xlm_str).unwrap()),
+            amount: Some(
+                serde_json::from_str(amount_xlm_str)
+                    .unwrap_or_else(|e| panic!("case {case}: amount parse failed: {e}")),
+            ),
             amount_in_stroops: None,
             asset: "native".to_owned(),
             memo_text: None,
@@ -805,116 +774,63 @@ async fn pay_native_profile_fee_none_uses_default_envelope_total_fee() {
     );
 }
 
-/// pay native subentry_count=0: balance = required - 1 → insufficient_balance.
+/// Checks native `stellar_pay` pre-flight reserve boundaries across subentry
+/// counts 0, 1, 5, and 25 at both `min_balance - 1` and `min_balance`.
 #[tokio::test]
 #[serial]
-async fn pay_native_preflight_subentry0_insufficient() {
-    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-    let _storage_home =
-        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-    let mock_server = MockServer::start().await;
-    let amount = 10_000_000_i64;
-    let min_balance = pay_native_min_balance(0, amount, FEE_STROOPS);
-    let result = run_pay_native_preflight(&mock_server, 0, min_balance - 1, r#""1 XLM""#).await;
-    assert_tool_error(result, "ledger.insufficient_balance");
-}
+async fn pay_native_preflight_subentry_matrix() {
+    const CASES: [(&str, u32, i64, Option<&str>); 8] = [
+        (
+            "subentry0_insufficient",
+            0,
+            -1,
+            Some("ledger.insufficient_balance"),
+        ),
+        ("subentry0_sufficient", 0, 0, None),
+        (
+            "subentry1_insufficient",
+            1,
+            -1,
+            Some("ledger.insufficient_balance"),
+        ),
+        ("subentry1_sufficient", 1, 0, None),
+        (
+            "subentry5_insufficient",
+            5,
+            -1,
+            Some("ledger.insufficient_balance"),
+        ),
+        ("subentry5_sufficient", 5, 0, None),
+        (
+            "subentry25_insufficient",
+            25,
+            -1,
+            Some("ledger.insufficient_balance"),
+        ),
+        ("subentry25_sufficient", 25, 0, None),
+    ];
 
-/// pay native subentry_count=0: exact minimum passes.
-#[tokio::test]
-#[serial]
-async fn pay_native_preflight_subentry0_sufficient() {
-    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-    let _storage_home =
-        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-    let mock_server = MockServer::start().await;
     let amount = 10_000_000_i64;
-    let min_balance = pay_native_min_balance(0, amount, FEE_STROOPS);
-    let result = run_pay_native_preflight(&mock_server, 0, min_balance, r#""1 XLM""#).await;
-    assert_tool_success(result);
-}
-
-/// pay native subentry_count=1: balance = required - 1 → insufficient_balance.
-#[tokio::test]
-#[serial]
-async fn pay_native_preflight_subentry1_insufficient() {
-    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-    let _storage_home =
-        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-    let mock_server = MockServer::start().await;
-    let amount = 10_000_000_i64;
-    let min_balance = pay_native_min_balance(1, amount, FEE_STROOPS);
-    let result = run_pay_native_preflight(&mock_server, 1, min_balance - 1, r#""1 XLM""#).await;
-    assert_tool_error(result, "ledger.insufficient_balance");
-}
-
-/// pay native subentry_count=1: exact minimum passes.
-#[tokio::test]
-#[serial]
-async fn pay_native_preflight_subentry1_sufficient() {
-    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-    let _storage_home =
-        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-    let mock_server = MockServer::start().await;
-    let amount = 10_000_000_i64;
-    let min_balance = pay_native_min_balance(1, amount, FEE_STROOPS);
-    let result = run_pay_native_preflight(&mock_server, 1, min_balance, r#""1 XLM""#).await;
-    assert_tool_success(result);
-}
-
-/// pay native subentry_count=5: balance = required - 1 → insufficient_balance.
-#[tokio::test]
-#[serial]
-async fn pay_native_preflight_subentry5_insufficient() {
-    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-    let _storage_home =
-        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-    let mock_server = MockServer::start().await;
-    let amount = 10_000_000_i64;
-    let min_balance = pay_native_min_balance(5, amount, FEE_STROOPS);
-    let result = run_pay_native_preflight(&mock_server, 5, min_balance - 1, r#""1 XLM""#).await;
-    assert_tool_error(result, "ledger.insufficient_balance");
-}
-
-/// pay native subentry_count=5: exact minimum passes.
-#[tokio::test]
-#[serial]
-async fn pay_native_preflight_subentry5_sufficient() {
-    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-    let _storage_home =
-        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-    let mock_server = MockServer::start().await;
-    let amount = 10_000_000_i64;
-    let min_balance = pay_native_min_balance(5, amount, FEE_STROOPS);
-    let result = run_pay_native_preflight(&mock_server, 5, min_balance, r#""1 XLM""#).await;
-    assert_tool_success(result);
-}
-
-/// pay native subentry_count=25: balance = required - 1 → insufficient_balance.
-#[tokio::test]
-#[serial]
-async fn pay_native_preflight_subentry25_insufficient() {
-    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-    let _storage_home =
-        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-    let mock_server = MockServer::start().await;
-    let amount = 10_000_000_i64;
-    let min_balance = pay_native_min_balance(25, amount, FEE_STROOPS);
-    let result = run_pay_native_preflight(&mock_server, 25, min_balance - 1, r#""1 XLM""#).await;
-    assert_tool_error(result, "ledger.insufficient_balance");
-}
-
-/// pay native subentry_count=25: exact minimum passes.
-#[tokio::test]
-#[serial]
-async fn pay_native_preflight_subentry25_sufficient() {
-    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-    let _storage_home =
-        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-    let mock_server = MockServer::start().await;
-    let amount = 10_000_000_i64;
-    let min_balance = pay_native_min_balance(25, amount, FEE_STROOPS);
-    let result = run_pay_native_preflight(&mock_server, 25, min_balance, r#""1 XLM""#).await;
-    assert_tool_success(result);
+    for (case, subentry_count, delta, expected_error) in CASES {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new()
+            .unwrap_or_else(|e| panic!("case {case}: StateSandbox::new failed: {e}"));
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let mock_server = MockServer::start().await;
+        let min_balance = pay_native_min_balance(subentry_count, amount, FEE_STROOPS);
+        let result = run_pay_native_preflight(
+            case,
+            &mock_server,
+            subentry_count,
+            min_balance + delta,
+            r#""1 XLM""#,
+        )
+        .await;
+        match expected_error {
+            Some(code) => assert_tool_error_for(case, result, code),
+            None => assert_tool_success_for(case, result),
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
