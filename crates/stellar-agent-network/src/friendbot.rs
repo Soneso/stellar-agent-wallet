@@ -1134,133 +1134,228 @@ mod tests {
 
     // ── validate_friendbot_url tests ──────────────────────────────────────────
 
-    #[test]
-    fn allowlisted_testnet_host_accepted() {
-        assert!(
-            validate_friendbot_url("https://friendbot.stellar.org").is_ok(),
-            "testnet Friendbot must be in the allow-list"
-        );
+    #[derive(Debug, Clone, Copy)]
+    enum ExpectedFriendbotUrl {
+        Ok,
+        HostNotAllowed,
+        NonHttps,
+        InvalidUrl,
+        CredentialsInUrl,
+        AnyErr,
     }
 
-    #[test]
-    fn allowlisted_futurenet_host_accepted() {
-        assert!(
-            validate_friendbot_url("https://friendbot-futurenet.stellar.org").is_ok(),
-            "futurenet Friendbot must be in the allow-list"
-        );
+    struct FriendbotUrlCase {
+        name: &'static str,
+        url: &'static str,
+        expected: ExpectedFriendbotUrl,
+        forbidden_in_error: &'static [&'static str],
     }
 
-    #[test]
-    fn non_allowlisted_host_rejected() {
-        let result = validate_friendbot_url("https://evil.example.com/friendbot");
+    fn assert_friendbot_url_case(case: &FriendbotUrlCase, result: &Result<(), FriendbotUrlError>) {
+        let matched = match case.expected {
+            ExpectedFriendbotUrl::Ok => result.is_ok(),
+            ExpectedFriendbotUrl::HostNotAllowed => {
+                matches!(result, Err(FriendbotUrlError::HostNotAllowed { .. }))
+            }
+            ExpectedFriendbotUrl::NonHttps => matches!(result, Err(FriendbotUrlError::NonHttps)),
+            ExpectedFriendbotUrl::InvalidUrl => {
+                matches!(result, Err(FriendbotUrlError::InvalidUrl))
+            }
+            ExpectedFriendbotUrl::CredentialsInUrl => {
+                matches!(result, Err(FriendbotUrlError::CredentialsInUrl))
+            }
+            ExpectedFriendbotUrl::AnyErr => result.is_err(),
+        };
         assert!(
-            matches!(result, Err(FriendbotUrlError::HostNotAllowed { .. })),
-            "non-allowlisted host must be rejected: {result:?}"
+            matched,
+            "case {}: expected {:?} for {:?}, got {:?}",
+            case.name, case.expected, case.url, result
         );
+        if let Err(err) = result {
+            let msg = err.to_string();
+            for secret in case.forbidden_in_error {
+                assert!(
+                    !msg.contains(secret),
+                    "case {}: error message must not reveal {secret:?}: {msg}",
+                    case.name
+                );
+            }
+        }
     }
 
+    /// Pins production `validate_friendbot_url` checks across allow-listed hosts,
+    /// scheme rules, userinfo redaction, host normalization, and malformed inputs.
     #[test]
-    fn http_scheme_rejected() {
-        let result = validate_friendbot_url("http://friendbot.stellar.org");
-        assert!(
-            matches!(result, Err(FriendbotUrlError::NonHttps)),
-            "non-HTTPS URL must be rejected: {result:?}"
-        );
+    fn validate_friendbot_url_production_cases() {
+        const CASES: &[FriendbotUrlCase] = &[
+            FriendbotUrlCase {
+                name: "allowlisted_testnet_host",
+                url: "https://friendbot.stellar.org",
+                expected: ExpectedFriendbotUrl::Ok,
+                forbidden_in_error: &[],
+            },
+            FriendbotUrlCase {
+                name: "allowlisted_futurenet_host",
+                url: "https://friendbot-futurenet.stellar.org",
+                expected: ExpectedFriendbotUrl::Ok,
+                forbidden_in_error: &[],
+            },
+            FriendbotUrlCase {
+                name: "non_allowlisted_host",
+                url: "https://evil.example.com/friendbot",
+                expected: ExpectedFriendbotUrl::HostNotAllowed,
+                forbidden_in_error: &[],
+            },
+            FriendbotUrlCase {
+                name: "http_scheme",
+                url: "http://friendbot.stellar.org",
+                expected: ExpectedFriendbotUrl::NonHttps,
+                forbidden_in_error: &[],
+            },
+            FriendbotUrlCase {
+                name: "malformed_url",
+                url: "not-a-url",
+                expected: ExpectedFriendbotUrl::InvalidUrl,
+                forbidden_in_error: &[],
+            },
+            FriendbotUrlCase {
+                name: "allowlisted_host_with_path",
+                url: "https://friendbot.stellar.org/some/path",
+                expected: ExpectedFriendbotUrl::Ok,
+                forbidden_in_error: &[],
+            },
+            FriendbotUrlCase {
+                name: "allowlisted_host_in_path_only",
+                url: "https://attacker.example.com/friendbot.stellar.org",
+                expected: ExpectedFriendbotUrl::AnyErr,
+                forbidden_in_error: &[],
+            },
+            FriendbotUrlCase {
+                name: "loopback_rejected_in_production",
+                url: "http://127.0.0.1:9999/friendbot",
+                expected: ExpectedFriendbotUrl::AnyErr,
+                forbidden_in_error: &[],
+            },
+            FriendbotUrlCase {
+                name: "userinfo_username_only",
+                url: "https://user@friendbot.stellar.org/",
+                expected: ExpectedFriendbotUrl::CredentialsInUrl,
+                forbidden_in_error: &[],
+            },
+            FriendbotUrlCase {
+                name: "userinfo_username_password",
+                url: "https://user:pass@friendbot.stellar.org/",
+                expected: ExpectedFriendbotUrl::CredentialsInUrl,
+                forbidden_in_error: &[],
+            },
+            // Userinfo check fires before the allow-list check, and the error
+            // message must not echo embedded credentials.
+            FriendbotUrlCase {
+                name: "userinfo_with_allowlisted_host_redacts_credentials",
+                url: "https://attacker:secret@friendbot.stellar.org/?addr=G123",
+                expected: ExpectedFriendbotUrl::CredentialsInUrl,
+                forbidden_in_error: &["attacker", "secret"],
+            },
+            FriendbotUrlCase {
+                name: "uppercase_host",
+                url: "https://FRIENDBOT.STELLAR.ORG/",
+                expected: ExpectedFriendbotUrl::Ok,
+                forbidden_in_error: &[],
+            },
+            FriendbotUrlCase {
+                name: "mixed_case_host",
+                url: "https://FriendBot.Stellar.Org/",
+                expected: ExpectedFriendbotUrl::Ok,
+                forbidden_in_error: &[],
+            },
+            // WHATWG URL parsing preserves trailing dots, so host_str() fails
+            // closed against the allow-list.
+            FriendbotUrlCase {
+                name: "trailing_dot_host",
+                url: "https://friendbot.stellar.org./",
+                expected: ExpectedFriendbotUrl::AnyErr,
+                forbidden_in_error: &[],
+            },
+            FriendbotUrlCase {
+                name: "default_https_port",
+                url: "https://friendbot.stellar.org:443/",
+                expected: ExpectedFriendbotUrl::Ok,
+                forbidden_in_error: &[],
+            },
+            // Cyrillic 'о' (U+043E) normalizes via IDNA to punycode and fails
+            // closed against the allow-list.
+            FriendbotUrlCase {
+                name: "idn_homograph_cyrillic",
+                url: "https://friendb\u{043E}t.stellar.org/",
+                expected: ExpectedFriendbotUrl::AnyErr,
+                forbidden_in_error: &[],
+            },
+            FriendbotUrlCase {
+                name: "ftp_scheme",
+                url: "ftp://friendbot.stellar.org/",
+                expected: ExpectedFriendbotUrl::NonHttps,
+                forbidden_in_error: &[],
+            },
+            FriendbotUrlCase {
+                name: "file_scheme",
+                url: "file:///etc/passwd",
+                expected: ExpectedFriendbotUrl::AnyErr,
+                forbidden_in_error: &[],
+            },
+            FriendbotUrlCase {
+                name: "data_uri",
+                url: "data:text/html,<script>alert(1)</script>",
+                expected: ExpectedFriendbotUrl::AnyErr,
+                forbidden_in_error: &[],
+            },
+            FriendbotUrlCase {
+                name: "javascript_scheme",
+                url: "javascript:alert(1)",
+                expected: ExpectedFriendbotUrl::AnyErr,
+                forbidden_in_error: &[],
+            },
+            FriendbotUrlCase {
+                name: "empty_dot_host",
+                url: "https://./path",
+                expected: ExpectedFriendbotUrl::AnyErr,
+                forbidden_in_error: &[],
+            },
+        ];
+
+        for case in CASES {
+            let result = validate_friendbot_url(case.url);
+            assert_friendbot_url_case(case, &result);
+        }
     }
 
+    /// Pins `validate_friendbot_url_allowing_loopback` acceptance for local HTTP
+    /// loopback hosts and rejection of non-allowlisted remote hosts.
     #[test]
-    fn malformed_url_rejected() {
-        let result = validate_friendbot_url("not-a-url");
-        assert!(
-            matches!(result, Err(FriendbotUrlError::InvalidUrl)),
-            "malformed URL must be rejected: {result:?}"
-        );
-    }
+    fn validate_friendbot_url_loopback_cases() {
+        const CASES: &[FriendbotUrlCase] = &[
+            FriendbotUrlCase {
+                name: "loopback_ipv4_http",
+                url: "http://127.0.0.1:9999/friendbot",
+                expected: ExpectedFriendbotUrl::Ok,
+                forbidden_in_error: &[],
+            },
+            FriendbotUrlCase {
+                name: "loopback_localhost_http",
+                url: "http://localhost:8888",
+                expected: ExpectedFriendbotUrl::Ok,
+                forbidden_in_error: &[],
+            },
+            FriendbotUrlCase {
+                name: "non_loopback_non_allowlisted",
+                url: "https://evil.example.com/friendbot",
+                expected: ExpectedFriendbotUrl::AnyErr,
+                forbidden_in_error: &[],
+            },
+        ];
 
-    #[test]
-    fn url_with_path_still_checks_host() {
-        assert!(
-            validate_friendbot_url("https://friendbot.stellar.org/some/path").is_ok(),
-            "URL with path is ok if host is allowlisted"
-        );
-        let result = validate_friendbot_url("https://attacker.example.com/friendbot.stellar.org");
-        assert!(
-            result.is_err(),
-            "path component cannot bypass host check: {result:?}"
-        );
-    }
-
-    #[test]
-    fn loopback_accepted_with_loopback_validator() {
-        assert!(
-            validate_friendbot_url_allowing_loopback("http://127.0.0.1:9999/friendbot").is_ok(),
-            "loopback validator must accept 127.0.0.1"
-        );
-        assert!(
-            validate_friendbot_url_allowing_loopback("http://localhost:8888").is_ok(),
-            "loopback validator must accept localhost"
-        );
-    }
-
-    #[test]
-    fn loopback_rejected_by_production_validator() {
-        let result = validate_friendbot_url("http://127.0.0.1:9999/friendbot");
-        assert!(
-            result.is_err(),
-            "production validator must reject loopback URL: {result:?}"
-        );
-    }
-
-    #[test]
-    fn non_loopback_non_allowlisted_rejected_by_loopback_validator() {
-        let result = validate_friendbot_url_allowing_loopback("https://evil.example.com/friendbot");
-        assert!(
-            result.is_err(),
-            "loopback validator must still reject non-allowlisted non-loopback: {result:?}"
-        );
-    }
-
-    // ── userinfo (credentials-in-URL) rejection tests ─────────────────────────
-
-    #[test]
-    fn userinfo_username_only_rejected() {
-        let result = validate_friendbot_url("https://user@friendbot.stellar.org/");
-        assert!(
-            matches!(result, Err(FriendbotUrlError::CredentialsInUrl)),
-            "username-only userinfo must be rejected: {result:?}"
-        );
-    }
-
-    #[test]
-    fn userinfo_username_password_rejected() {
-        let result = validate_friendbot_url("https://user:pass@friendbot.stellar.org/");
-        assert!(
-            matches!(result, Err(FriendbotUrlError::CredentialsInUrl)),
-            "user:password userinfo must be rejected: {result:?}"
-        );
-    }
-
-    #[test]
-    fn userinfo_with_allowlisted_host_rejected() {
-        // Even an allow-listed host paired with userinfo must be rejected — the
-        // userinfo check fires before the allow-list check.
-        let result =
-            validate_friendbot_url("https://attacker:secret@friendbot.stellar.org/?addr=G123");
-        assert!(
-            matches!(result, Err(FriendbotUrlError::CredentialsInUrl)),
-            "allow-listed host with userinfo must be rejected: {result:?}"
-        );
-        // Error message must not echo the URL.
-        if let Err(error @ FriendbotUrlError::CredentialsInUrl) = result {
-            let msg = error.to_string();
-            assert!(
-                !msg.contains("attacker"),
-                "error message must not reveal credentials: {msg}"
-            );
-            assert!(
-                !msg.contains("secret"),
-                "error message must not reveal credentials: {msg}"
-            );
+        for case in CASES {
+            let result = validate_friendbot_url_allowing_loopback(case.url);
+            assert_friendbot_url_case(case, &result);
         }
     }
 
@@ -1301,118 +1396,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    // ── case-insensitive host comparison tests ────────────────────────────────
-
-    #[test]
-    fn uppercase_host_accepted() {
-        assert!(
-            validate_friendbot_url("https://FRIENDBOT.STELLAR.ORG/").is_ok(),
-            "all-uppercase allow-listed host must be accepted"
-        );
-    }
-
-    #[test]
-    fn mixed_case_host_accepted() {
-        assert!(
-            validate_friendbot_url("https://FriendBot.Stellar.Org/").is_ok(),
-            "mixed-case allow-listed host must be accepted"
-        );
-    }
-
-    /// The `url` crate preserves trailing dots in hostname strings — it does
-    /// NOT strip them per WHATWG URL spec §4.2 host parsing.  A trailing-dot
-    /// host `friendbot.stellar.org.` is therefore NOT equivalent to
-    /// `friendbot.stellar.org` after parsing and is rejected by the allow-list.
-    ///
-    /// This behaviour is intentional as a security property: unexpected hostname
-    /// syntax variants should fail closed rather than be silently normalised.
-    #[test]
-    fn trailing_dot_host_rejected_not_in_allowlist() {
-        // The url crate preserves "friendbot.stellar.org." with the trailing
-        // dot; the parsed host_str() includes the dot and does NOT match
-        // "friendbot.stellar.org" in the allow-list — correctly rejected.
-        let result = validate_friendbot_url("https://friendbot.stellar.org./");
-        assert!(
-            result.is_err(),
-            "trailing-dot host is NOT normalised by the url crate and must be rejected: {result:?}"
-        );
-    }
-
-    #[test]
-    fn default_port_accepted() {
-        assert!(
-            validate_friendbot_url("https://friendbot.stellar.org:443/").is_ok(),
-            "explicit default HTTPS port 443 must be accepted"
-        );
-    }
-
-    /// IDN homograph: the `url` crate normalises Punycode hosts via IDNA.
-    /// A cyrillic-lookalike host serialises to `xn--...` which does NOT match
-    /// `friendbot.stellar.org`, so it is correctly rejected.
-    #[test]
-    fn idn_homograph_cyrillic_rejected() {
-        // "friendbоt.stellar.org" with cyrillic 'о' (U+043E) instead of latin
-        // 'o' (U+006F).  After IDNA processing the host becomes something like
-        // "xn--friendbt-qxa.stellar.org" which is not in the allow-list.
-        let result = validate_friendbot_url("https://friendb\u{043E}t.stellar.org/");
-        assert!(
-            result.is_err(),
-            "IDN homograph with cyrillic 'о' must be rejected: {result:?}"
-        );
-    }
-
-    // ── explicit scheme rejection tests ───────────────────────────────────────
-
-    #[test]
-    fn ftp_scheme_rejected() {
-        let result = validate_friendbot_url("ftp://friendbot.stellar.org/");
-        assert!(
-            matches!(result, Err(FriendbotUrlError::NonHttps)),
-            "ftp:// scheme must be rejected with NonHttps: {result:?}"
-        );
-    }
-
-    #[test]
-    fn file_scheme_rejected() {
-        // file:///etc/passwd has no host, so it fails with InvalidUrl
-        // (missing host) rather than NonHttps — both are error outcomes.
-        // The important property is that it is rejected.
-        let result = validate_friendbot_url("file:///etc/passwd");
-        assert!(
-            result.is_err(),
-            "file:// scheme must be rejected: {result:?}"
-        );
-    }
-
-    #[test]
-    fn data_uri_rejected() {
-        // data: URIs have no host; they fail at the host_str() check.
-        let result = validate_friendbot_url("data:text/html,<script>alert(1)</script>");
-        assert!(result.is_err(), "data: URI must be rejected: {result:?}");
-    }
-
-    #[test]
-    fn javascript_scheme_rejected() {
-        // javascript: pseudo-URIs are not valid URLs and fail at parse time.
-        let result = validate_friendbot_url("javascript:alert(1)");
-        assert!(
-            result.is_err(),
-            "javascript: scheme must be rejected: {result:?}"
-        );
-    }
-
-    // ── host-emptiness edge cases ─────────────────────────────────────────────
-
-    #[test]
-    fn empty_host_in_https_url_rejected() {
-        // https://./path has an empty host — must be rejected.
-        let result = validate_friendbot_url("https://./path");
-        assert!(
-            result.is_err(),
-            "https:// URL with empty/dot-only host must be rejected: {result:?}"
-        );
     }
 
     // ── reqwest-reason redaction hardening ───────────────────────────────────
