@@ -366,251 +366,174 @@ mod tests {
 
     use super::*;
 
+    /// Maps every tested `Sep10Error` variant to its stable `sep10.*` wire code.
     #[test]
-    fn wire_code_invalid_sequence_number() {
-        assert_eq!(
-            Sep10Error::InvalidSequenceNumber { found: 1 }.wire_code(),
-            "sep10.invalid_sequence_number"
-        );
-    }
+    fn wire_code_maps_every_variant() {
+        let cases = [
+            (
+                "invalid_sequence_number",
+                Sep10Error::InvalidSequenceNumber { found: 1 },
+                "sep10.invalid_sequence_number",
+            ),
+            (
+                "invalid_time_bounds",
+                Sep10Error::InvalidTimeBounds {
+                    detail: "no time bounds set".to_owned(),
+                },
+                "sep10.invalid_time_bounds",
+            ),
+            (
+                "challenge_expired",
+                Sep10Error::ChallengeExpired {
+                    exp_unix: 1_000,
+                    now_unix: 2_000,
+                },
+                "sep10.challenge_expired",
+            ),
+            (
+                "challenge_not_yet_valid",
+                Sep10Error::ChallengeNotYetValid {
+                    min_unix: 2_000,
+                    now_unix: 1_000,
+                },
+                "sep10.challenge_not_yet_valid",
+            ),
+            (
+                "invalid_source_account",
+                Sep10Error::InvalidSourceAccount {
+                    detail: "source account mismatch".to_owned(),
+                },
+                "sep10.invalid_source_account",
+            ),
+            (
+                "missing_operations",
+                Sep10Error::MissingOperations,
+                "sep10.missing_operations",
+            ),
+            (
+                "invalid_first_operation",
+                Sep10Error::InvalidFirstOperation {
+                    detail: "not ManageData".to_owned(),
+                },
+                "sep10.invalid_first_operation",
+            ),
+            (
+                "invalid_nonce_length",
+                Sep10Error::InvalidNonceLength {
+                    found: 32,
+                    expected: 64,
+                },
+                "sep10.invalid_nonce_length",
+            ),
+            (
+                "invalid_nonce_format",
+                Sep10Error::InvalidNonceFormat {
+                    detail: "not base64".to_owned(),
+                },
+                "sep10.invalid_nonce_format",
+            ),
+            (
+                "invalid_manage_data_key",
+                Sep10Error::InvalidManageDataKey {
+                    detail: "wrong key format".to_owned(),
+                },
+                "sep10.invalid_manage_data_key",
+            ),
+            (
+                "missing_web_auth_domain_op",
+                Sep10Error::MissingWebAuthDomainOp,
+                "sep10.missing_web_auth_domain_op",
+            ),
+            (
+                "web_auth_domain_mismatch",
+                Sep10Error::WebAuthDomainMismatch {
+                    found: "evil.com".to_owned(),
+                    expected: "example.com".to_owned(),
+                },
+                "sep10.web_auth_domain_mismatch",
+            ),
+            (
+                "invalid_client_domain_op",
+                Sep10Error::InvalidClientDomainOp {
+                    detail: "source is server account".to_owned(),
+                },
+                "sep10.invalid_client_domain_op",
+            ),
+            (
+                "unexpected_operation_source",
+                Sep10Error::UnexpectedOperationSource {
+                    op_index: 2,
+                    detail: "source is not server account".to_owned(),
+                },
+                "sep10.unexpected_operation_source",
+            ),
+            (
+                "missing_server_signature",
+                Sep10Error::MissingServerSignature,
+                "sep10.missing_server_signature",
+            ),
+            (
+                "invalid_server_signature",
+                Sep10Error::InvalidServerSignature {
+                    detail: "sig does not verify".to_owned(),
+                },
+                "sep10.invalid_server_signature",
+            ),
+            (
+                "xdr_decode_error",
+                Sep10Error::XdrDecodeError {
+                    detail: "base64 decode failed".to_owned(),
+                },
+                "sep10.xdr_decode_error",
+            ),
+            (
+                "http_error",
+                Sep10Error::HttpError {
+                    detail: "connection refused".to_owned(),
+                },
+                "sep10.http_error",
+            ),
+            (
+                "jwt_parse_error",
+                Sep10Error::JwtParseError {
+                    detail: "missing claims".to_owned(),
+                },
+                "sep10.jwt_parse_error",
+            ),
+            (
+                "jwt_expired",
+                Sep10Error::JwtExpired {
+                    exp_unix: 100,
+                    now_unix: 200,
+                },
+                "sep10.jwt_expired",
+            ),
+            (
+                "replay_detected",
+                Sep10Error::ReplayDetected {
+                    detail: "duplicate challenge XDR".to_owned(),
+                },
+                "sep10.replay_detected",
+            ),
+            (
+                "session_account_mismatch",
+                Sep10Error::SessionAccountMismatch {
+                    detail: "GABC…WXYZ vs GDEF…STUV".to_owned(),
+                },
+                "sep10.session_account_mismatch",
+            ),
+            (
+                "invalid_web_auth_endpoint",
+                Sep10Error::InvalidWebAuthEndpoint {
+                    detail: "no host in endpoint URL".to_owned(),
+                },
+                "sep10.invalid_web_auth_endpoint",
+            ),
+        ];
 
-    #[test]
-    fn wire_code_invalid_time_bounds() {
-        assert_eq!(
-            Sep10Error::InvalidTimeBounds {
-                detail: "no time bounds set".to_owned()
-            }
-            .wire_code(),
-            "sep10.invalid_time_bounds"
-        );
-    }
-
-    #[test]
-    fn wire_code_challenge_expired() {
-        assert_eq!(
-            Sep10Error::ChallengeExpired {
-                exp_unix: 1_000,
-                now_unix: 2_000
-            }
-            .wire_code(),
-            "sep10.challenge_expired"
-        );
-    }
-
-    #[test]
-    fn wire_code_challenge_not_yet_valid() {
-        assert_eq!(
-            Sep10Error::ChallengeNotYetValid {
-                min_unix: 2_000,
-                now_unix: 1_000
-            }
-            .wire_code(),
-            "sep10.challenge_not_yet_valid"
-        );
-    }
-
-    #[test]
-    fn wire_code_invalid_source_account() {
-        assert_eq!(
-            Sep10Error::InvalidSourceAccount {
-                detail: "source account mismatch".to_owned()
-            }
-            .wire_code(),
-            "sep10.invalid_source_account"
-        );
-    }
-
-    #[test]
-    fn wire_code_missing_operations() {
-        assert_eq!(
-            Sep10Error::MissingOperations.wire_code(),
-            "sep10.missing_operations"
-        );
-    }
-
-    #[test]
-    fn wire_code_invalid_first_operation() {
-        assert_eq!(
-            Sep10Error::InvalidFirstOperation {
-                detail: "not ManageData".to_owned()
-            }
-            .wire_code(),
-            "sep10.invalid_first_operation"
-        );
-    }
-
-    #[test]
-    fn wire_code_invalid_nonce_length() {
-        assert_eq!(
-            Sep10Error::InvalidNonceLength {
-                found: 32,
-                expected: 64
-            }
-            .wire_code(),
-            "sep10.invalid_nonce_length"
-        );
-    }
-
-    #[test]
-    fn wire_code_invalid_nonce_format() {
-        assert_eq!(
-            Sep10Error::InvalidNonceFormat {
-                detail: "not base64".to_owned()
-            }
-            .wire_code(),
-            "sep10.invalid_nonce_format"
-        );
-    }
-
-    #[test]
-    fn wire_code_invalid_manage_data_key() {
-        assert_eq!(
-            Sep10Error::InvalidManageDataKey {
-                detail: "wrong key format".to_owned()
-            }
-            .wire_code(),
-            "sep10.invalid_manage_data_key"
-        );
-    }
-
-    #[test]
-    fn wire_code_missing_web_auth_domain_op() {
-        assert_eq!(
-            Sep10Error::MissingWebAuthDomainOp.wire_code(),
-            "sep10.missing_web_auth_domain_op"
-        );
-    }
-
-    #[test]
-    fn wire_code_web_auth_domain_mismatch() {
-        assert_eq!(
-            Sep10Error::WebAuthDomainMismatch {
-                found: "evil.com".to_owned(),
-                expected: "example.com".to_owned()
-            }
-            .wire_code(),
-            "sep10.web_auth_domain_mismatch"
-        );
-    }
-
-    #[test]
-    fn wire_code_invalid_client_domain_op() {
-        assert_eq!(
-            Sep10Error::InvalidClientDomainOp {
-                detail: "source is server account".to_owned()
-            }
-            .wire_code(),
-            "sep10.invalid_client_domain_op"
-        );
-    }
-
-    #[test]
-    fn wire_code_unexpected_operation_source() {
-        assert_eq!(
-            Sep10Error::UnexpectedOperationSource {
-                op_index: 2,
-                detail: "source is not server account".to_owned()
-            }
-            .wire_code(),
-            "sep10.unexpected_operation_source"
-        );
-    }
-
-    #[test]
-    fn wire_code_missing_server_signature() {
-        assert_eq!(
-            Sep10Error::MissingServerSignature.wire_code(),
-            "sep10.missing_server_signature"
-        );
-    }
-
-    #[test]
-    fn wire_code_invalid_server_signature() {
-        assert_eq!(
-            Sep10Error::InvalidServerSignature {
-                detail: "sig does not verify".to_owned()
-            }
-            .wire_code(),
-            "sep10.invalid_server_signature"
-        );
-    }
-
-    #[test]
-    fn wire_code_xdr_decode_error() {
-        assert_eq!(
-            Sep10Error::XdrDecodeError {
-                detail: "base64 decode failed".to_owned()
-            }
-            .wire_code(),
-            "sep10.xdr_decode_error"
-        );
-    }
-
-    #[test]
-    fn wire_code_http_error() {
-        assert_eq!(
-            Sep10Error::HttpError {
-                detail: "connection refused".to_owned()
-            }
-            .wire_code(),
-            "sep10.http_error"
-        );
-    }
-
-    #[test]
-    fn wire_code_jwt_parse_error() {
-        assert_eq!(
-            Sep10Error::JwtParseError {
-                detail: "missing claims".to_owned()
-            }
-            .wire_code(),
-            "sep10.jwt_parse_error"
-        );
-    }
-
-    #[test]
-    fn wire_code_jwt_expired() {
-        assert_eq!(
-            Sep10Error::JwtExpired {
-                exp_unix: 100,
-                now_unix: 200
-            }
-            .wire_code(),
-            "sep10.jwt_expired"
-        );
-    }
-
-    #[test]
-    fn wire_code_replay_detected() {
-        assert_eq!(
-            Sep10Error::ReplayDetected {
-                detail: "duplicate challenge XDR".to_owned()
-            }
-            .wire_code(),
-            "sep10.replay_detected"
-        );
-    }
-
-    #[test]
-    fn wire_code_session_account_mismatch() {
-        assert_eq!(
-            Sep10Error::SessionAccountMismatch {
-                detail: "GABC…WXYZ vs GDEF…STUV".to_owned()
-            }
-            .wire_code(),
-            "sep10.session_account_mismatch"
-        );
-    }
-
-    #[test]
-    fn wire_code_invalid_web_auth_endpoint() {
-        assert_eq!(
-            Sep10Error::InvalidWebAuthEndpoint {
-                detail: "no host in endpoint URL".to_owned()
-            }
-            .wire_code(),
-            "sep10.invalid_web_auth_endpoint"
-        );
+        for (case, err, expected) in cases {
+            assert_eq!(err.wire_code(), expected, "case {case}");
+        }
     }
 
     #[test]

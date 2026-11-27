@@ -2708,29 +2708,6 @@ mod tests {
         );
     }
 
-    /// A revoked or retired verifier refuses at the policy gate, like the
-    /// pinned-hash drift check whose match path raises it.
-    #[test]
-    fn map_sa_error_to_phase_verifier_status_refusals_map_to_policy_gate() {
-        use stellar_agent_core::observability::RedactedStrkey;
-        let errors = [
-            SaError::VerifierWasmRevoked {
-                rule_id: None,
-                smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...AAAAA"),
-                revoked_reason: "problem".to_owned(),
-                request_id: "status".to_owned(),
-            },
-            SaError::VerifierWasmRetired {
-                rule_id: Some(1),
-                smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...AAAAA"),
-                request_id: "status".to_owned(),
-            },
-        ];
-        for error in errors {
-            assert_eq!(map_sa_error_to_multicall_phase(&error), "policy_gate");
-        }
-    }
-
     /// An unsizable call's denial records `unsizable_value_effect`.
     #[test]
     fn deny_reason_wire_code_unsizable_value_effect() {
@@ -4373,86 +4350,294 @@ wasm_sha256 = "{drifted_sha}"
 
     // ── map_sa_error_to_multicall_phase ───────────────────────────────────────
 
-    /// `DeploymentFailed { phase: "simulate" }` maps to `"simulate"`.
+    /// Maps `SaError` variants, deployment phases, simulation-divergence sub-codes,
+    /// auth-entry stages, and verifier or pin refusals to their multicall phases.
     #[test]
-    fn map_sa_error_to_phase_deployment_failed_simulate() {
-        let err = SaError::DeploymentFailed {
-            phase: "simulate",
-            redacted_reason: "test".to_owned(),
-        };
-        assert_eq!(map_sa_error_to_multicall_phase(&err), "simulate");
-    }
-
-    /// `DeploymentFailed { phase: "submit" }` maps to `"submit"`.
-    #[test]
-    fn map_sa_error_to_phase_deployment_failed_submit() {
-        let err = SaError::DeploymentFailed {
-            phase: "submit",
-            redacted_reason: "test".to_owned(),
-        };
-        assert_eq!(map_sa_error_to_multicall_phase(&err), "submit");
-    }
-
-    /// `DeploymentFailed { phase: "build" }` (unknown sub-phase) conservatively maps
-    /// to `"simulate"`.
-    #[test]
-    fn map_sa_error_to_phase_deployment_failed_unknown_phase_maps_to_simulate() {
-        let err = SaError::DeploymentFailed {
-            phase: "build",
-            redacted_reason: "test".to_owned(),
-        };
-        assert_eq!(map_sa_error_to_multicall_phase(&err), "simulate");
-    }
-
-    /// `AuthEntryConstructionFailed` maps to `"sign"`.
-    #[test]
-    fn map_sa_error_to_phase_auth_entry_construction_failed_maps_to_sign() {
-        let err = SaError::AuthEntryConstructionFailed {
-            stage: "sign",
-            redacted_reason: "test".to_owned(),
-        };
-        assert_eq!(map_sa_error_to_multicall_phase(&err), "sign");
-    }
-
-    /// `RuleIdMismatch` maps to `"sign"`.
-    #[test]
-    fn map_sa_error_to_phase_rule_id_mismatch_maps_to_sign() {
-        let err = SaError::RuleIdMismatch {
-            expected_len: 1,
-            observed_len: 0,
-        };
-        assert_eq!(map_sa_error_to_multicall_phase(&err), "sign");
-    }
-
-    /// `SimulationDivergence` maps to `"sign"` under every sub-code: the
-    /// signed-tree and context-rule checks refuse after simulation, before
-    /// anything is signed or sent.
-    #[test]
-    fn map_sa_error_to_phase_simulation_divergence_maps_to_sign() {
+    fn map_sa_error_to_multicall_phase_maps_every_case() {
         use crate::error::SimulationDivergenceSubCode;
-        for sub_code in [
-            SimulationDivergenceSubCode::ContextRuleIds,
-            SimulationDivergenceSubCode::AuthContexts,
-            SimulationDivergenceSubCode::Network,
-            SimulationDivergenceSubCode::Sequence,
-            SimulationDivergenceSubCode::FeeEnvelope,
-        ] {
-            let err = SaError::SimulationDivergence {
-                sub_code,
-                redacted_reason: "test".to_owned(),
-            };
-            assert_eq!(map_sa_error_to_multicall_phase(&err), "sign", "{err:?}");
-        }
-    }
+        use stellar_agent_core::audit_log::schema::WasmHashPin;
+        use stellar_agent_core::observability::RedactedStrkey;
 
-    /// `SubmitCheckMissing` maps to `"build"`.
-    #[test]
-    fn map_sa_error_to_phase_submit_check_missing_maps_to_build() {
-        let err = SaError::SubmitCheckMissing {
-            required_check: "multicall",
-            host_function_kind: "InvokeContract",
-        };
-        assert_eq!(map_sa_error_to_multicall_phase(&err), "build");
+        let redacted_a = || RedactedStrkey::from_already_redacted("CAAAA...AAAAA");
+        let redacted_z = || RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ");
+
+        let cases = [
+            (
+                "verifier_wasm_revoked",
+                SaError::VerifierWasmRevoked {
+                    rule_id: None,
+                    smart_account_redacted: redacted_a(),
+                    revoked_reason: "problem".to_owned(),
+                    request_id: "status".to_owned(),
+                },
+                "policy_gate",
+            ),
+            (
+                "verifier_wasm_retired",
+                SaError::VerifierWasmRetired {
+                    rule_id: Some(1),
+                    smart_account_redacted: redacted_a(),
+                    request_id: "status".to_owned(),
+                },
+                "policy_gate",
+            ),
+            (
+                "deployment_failed_simulate",
+                SaError::DeploymentFailed {
+                    phase: "simulate",
+                    redacted_reason: "test".to_owned(),
+                },
+                "simulate",
+            ),
+            (
+                "deployment_failed_submit",
+                SaError::DeploymentFailed {
+                    phase: "submit",
+                    redacted_reason: "test".to_owned(),
+                },
+                "submit",
+            ),
+            (
+                "deployment_failed_unknown_build",
+                SaError::DeploymentFailed {
+                    phase: "build",
+                    redacted_reason: "test".to_owned(),
+                },
+                "simulate",
+            ),
+            (
+                "auth_entry_construction_failed_sign",
+                SaError::AuthEntryConstructionFailed {
+                    stage: "sign",
+                    redacted_reason: "test".to_owned(),
+                },
+                "sign",
+            ),
+            (
+                "rule_id_mismatch",
+                SaError::RuleIdMismatch {
+                    expected_len: 1,
+                    observed_len: 0,
+                },
+                "sign",
+            ),
+            (
+                "simulation_divergence_context_rule_ids",
+                SaError::SimulationDivergence {
+                    sub_code: SimulationDivergenceSubCode::ContextRuleIds,
+                    redacted_reason: "test".to_owned(),
+                },
+                "sign",
+            ),
+            (
+                "simulation_divergence_auth_contexts",
+                SaError::SimulationDivergence {
+                    sub_code: SimulationDivergenceSubCode::AuthContexts,
+                    redacted_reason: "test".to_owned(),
+                },
+                "sign",
+            ),
+            (
+                "simulation_divergence_network",
+                SaError::SimulationDivergence {
+                    sub_code: SimulationDivergenceSubCode::Network,
+                    redacted_reason: "test".to_owned(),
+                },
+                "sign",
+            ),
+            (
+                "simulation_divergence_sequence",
+                SaError::SimulationDivergence {
+                    sub_code: SimulationDivergenceSubCode::Sequence,
+                    redacted_reason: "test".to_owned(),
+                },
+                "sign",
+            ),
+            (
+                "simulation_divergence_fee_envelope",
+                SaError::SimulationDivergence {
+                    sub_code: SimulationDivergenceSubCode::FeeEnvelope,
+                    redacted_reason: "test".to_owned(),
+                },
+                "sign",
+            ),
+            (
+                "submit_check_missing",
+                SaError::SubmitCheckMissing {
+                    required_check: "multicall",
+                    host_function_kind: "InvokeContract",
+                },
+                "build",
+            ),
+            (
+                "horizon_exceeded",
+                SaError::HorizonExceeded {
+                    rule_id_or_pending: None,
+                    requested_horizon: 2000,
+                    max_horizon: 1000,
+                },
+                "policy_gate",
+            ),
+            (
+                "rule_expired",
+                SaError::RuleExpired {
+                    rule_id: 1,
+                    valid_until: 100,
+                    current: 200,
+                },
+                "policy_gate",
+            ),
+            (
+                "verifier_hash_drift",
+                SaError::VerifierHashDrift {
+                    rule_id: 2,
+                    smart_account_redacted: redacted_z(),
+                    deploy_address_redacted: redacted_z(),
+                    pinned_hash: WasmHashPin::new([0xaa; 32]),
+                    request_id: "req".to_owned(),
+                },
+                "policy_gate",
+            ),
+            (
+                "policy_hash_drift",
+                SaError::PolicyHashDrift {
+                    rule_id: 2,
+                    smart_account_redacted: redacted_z(),
+                    deploy_address_redacted: redacted_z(),
+                    pinned_hash: WasmHashPin::new([0xaa; 32]),
+                    request_id: "req".to_owned(),
+                },
+                "policy_gate",
+            ),
+            (
+                "pinned_policy_absent",
+                SaError::PinnedPolicyAbsent {
+                    rule_id: 2,
+                    pinned_count: 1,
+                    smart_account_redacted: redacted_z(),
+                    request_id: "req".to_owned(),
+                },
+                "policy_gate",
+            ),
+            (
+                "pinned_verifier_absent",
+                SaError::PinnedVerifierAbsent {
+                    rule_id: 2,
+                    verifier_redacted: redacted_z(),
+                    smart_account_redacted: redacted_z(),
+                    request_id: "req".to_owned(),
+                },
+                "policy_gate",
+            ),
+            (
+                "wasm_pin_incomplete",
+                SaError::WasmPinIncomplete {
+                    rule_id: 2,
+                    smart_account_redacted: redacted_z(),
+                    request_id: "req".to_owned(),
+                },
+                "policy_gate",
+            ),
+            (
+                "pin_check_unavailable",
+                SaError::PinCheckUnavailable {
+                    rule_id: 2,
+                    smart_account_redacted: redacted_z(),
+                    reason: "sa.deployment_failed: rpc unreachable".to_owned(),
+                    request_id: "req".to_owned(),
+                },
+                "policy_gate",
+            ),
+            (
+                "auth_entry_stage_rule_lock",
+                SaError::AuthEntryConstructionFailed {
+                    stage: "rule_lock",
+                    redacted_reason: "test".to_owned(),
+                },
+                "policy_gate",
+            ),
+            (
+                "auth_entry_stage_rule_lock_missing",
+                SaError::AuthEntryConstructionFailed {
+                    stage: "rule_lock_missing",
+                    redacted_reason: "test".to_owned(),
+                },
+                "policy_gate",
+            ),
+            (
+                "auth_entry_stage_rule_locks_without_pin_check",
+                SaError::AuthEntryConstructionFailed {
+                    stage: "rule_locks_without_pin_check",
+                    redacted_reason: "test".to_owned(),
+                },
+                "policy_gate",
+            ),
+            (
+                "auth_entry_stage_baseline_read",
+                SaError::AuthEntryConstructionFailed {
+                    stage: "baseline_read",
+                    redacted_reason: "test".to_owned(),
+                },
+                "policy_gate",
+            ),
+            (
+                "auth_entry_stage_signer_set_compare",
+                SaError::AuthEntryConstructionFailed {
+                    stage: "signer_set_compare",
+                    redacted_reason: "test".to_owned(),
+                },
+                "policy_gate",
+            ),
+            (
+                "auth_entry_stage_auth_payload",
+                SaError::AuthEntryConstructionFailed {
+                    stage: "auth_payload",
+                    redacted_reason: "test".to_owned(),
+                },
+                "sign",
+            ),
+            (
+                "auth_entry_stage_pin_check_required",
+                SaError::AuthEntryConstructionFailed {
+                    stage: "pin_check_required",
+                    redacted_reason: "test".to_owned(),
+                },
+                "sign",
+            ),
+            (
+                "auth_entry_stage_quorum_signatures",
+                SaError::AuthEntryConstructionFailed {
+                    stage: "quorum_signatures",
+                    redacted_reason: "test".to_owned(),
+                },
+                "sign",
+            ),
+            (
+                "multicall_failed_nested_build",
+                SaError::MulticallFailed {
+                    phase: "build",
+                    redacted_reason: "nested".to_owned(),
+                    post_submit_kind: None,
+                },
+                "build",
+            ),
+            (
+                "unrecognised_registry_entry_not_found",
+                SaError::MulticallRegistryEntryNotFound {
+                    network_safename: "testnet".to_owned(),
+                },
+                "submit",
+            ),
+        ];
+
+        for (case, err, expected_phase) in cases {
+            assert_eq!(
+                map_sa_error_to_multicall_phase(&err),
+                expected_phase,
+                "case {case} ({})",
+                err.wire_code()
+            );
+        }
     }
 
     /// A mainnet refusal returns unwrapped, after a denied row at phase
@@ -4587,84 +4772,6 @@ wasm_sha256 = "{drifted_sha}"
         }
     }
 
-    /// `HorizonExceeded` maps to `"policy_gate"`.
-    #[test]
-    fn map_sa_error_to_phase_horizon_exceeded_maps_to_policy_gate() {
-        let err = SaError::HorizonExceeded {
-            rule_id_or_pending: None,
-            requested_horizon: 2000,
-            max_horizon: 1000,
-        };
-        assert_eq!(map_sa_error_to_multicall_phase(&err), "policy_gate");
-    }
-
-    /// `RuleExpired` maps to `"policy_gate"`.
-    #[test]
-    fn map_sa_error_to_phase_rule_expired_maps_to_policy_gate() {
-        let err = SaError::RuleExpired {
-            rule_id: 1,
-            valid_until: 100,
-            current: 200,
-        };
-        assert_eq!(map_sa_error_to_multicall_phase(&err), "policy_gate");
-    }
-
-    /// A drift refusal, a pinned policy absent from chain, a live verifier
-    /// the pin record does not pin and an unavailable drift check map to
-    /// `"policy_gate"`: all refuse before simulation.
-    #[test]
-    fn map_sa_error_to_phase_pin_check_refusals_map_to_policy_gate() {
-        use stellar_agent_core::observability::RedactedStrkey;
-        let redacted = || RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ");
-        let refusals = [
-            SaError::VerifierHashDrift {
-                rule_id: 2,
-                smart_account_redacted: redacted(),
-                deploy_address_redacted: redacted(),
-                pinned_hash: stellar_agent_core::audit_log::schema::WasmHashPin::new([0xaa; 32]),
-                request_id: "req".to_owned(),
-            },
-            SaError::PolicyHashDrift {
-                rule_id: 2,
-                smart_account_redacted: redacted(),
-                deploy_address_redacted: redacted(),
-                pinned_hash: stellar_agent_core::audit_log::schema::WasmHashPin::new([0xaa; 32]),
-                request_id: "req".to_owned(),
-            },
-            SaError::PinnedPolicyAbsent {
-                rule_id: 2,
-                pinned_count: 1,
-                smart_account_redacted: redacted(),
-                request_id: "req".to_owned(),
-            },
-            SaError::PinnedVerifierAbsent {
-                rule_id: 2,
-                verifier_redacted: redacted(),
-                smart_account_redacted: redacted(),
-                request_id: "req".to_owned(),
-            },
-            SaError::WasmPinIncomplete {
-                rule_id: 2,
-                smart_account_redacted: redacted(),
-                request_id: "req".to_owned(),
-            },
-            SaError::PinCheckUnavailable {
-                rule_id: 2,
-                smart_account_redacted: redacted(),
-                reason: "sa.deployment_failed: rpc unreachable".to_owned(),
-                request_id: "req".to_owned(),
-            },
-        ];
-        for err in &refusals {
-            assert_eq!(
-                map_sa_error_to_multicall_phase(err),
-                "policy_gate",
-                "{}",
-                err.wire_code()
-            );
-        }
-    }
-
     /// The signer-set refusals of the authorizing rule map to
     /// `"policy_gate"`: each refuses before simulation.
     #[test]
@@ -4749,56 +4856,6 @@ wasm_sha256 = "{drifted_sha}"
                 err.wire_code()
             );
         }
-    }
-
-    /// The rule-lock and signer-set stages of an auth-entry construction
-    /// failure map to `"policy_gate"`; every other stage stays `"sign"`.
-    #[test]
-    fn map_sa_error_to_phase_rule_check_stages_map_to_policy_gate() {
-        for stage in [
-            "rule_lock",
-            "rule_lock_missing",
-            "rule_locks_without_pin_check",
-            "baseline_read",
-            "signer_set_compare",
-        ] {
-            let err = SaError::AuthEntryConstructionFailed {
-                stage,
-                redacted_reason: "test".to_owned(),
-            };
-            assert_eq!(
-                map_sa_error_to_multicall_phase(&err),
-                "policy_gate",
-                "{stage}"
-            );
-        }
-        for stage in ["auth_payload", "pin_check_required", "quorum_signatures"] {
-            let err = SaError::AuthEntryConstructionFailed {
-                stage,
-                redacted_reason: "test".to_owned(),
-            };
-            assert_eq!(map_sa_error_to_multicall_phase(&err), "sign", "{stage}");
-        }
-    }
-
-    /// A nested multicall failure keeps its phase.
-    #[test]
-    fn map_sa_error_to_phase_multicall_failed_nested_keeps_its_phase() {
-        let err = SaError::MulticallFailed {
-            phase: "build",
-            redacted_reason: "nested".to_owned(),
-            post_submit_kind: None,
-        };
-        assert_eq!(map_sa_error_to_multicall_phase(&err), "build");
-    }
-
-    /// An unrecognised error (e.g. `MulticallRegistryEntryNotFound`) maps to `"submit"`.
-    #[test]
-    fn map_sa_error_to_phase_unrecognised_maps_to_submit() {
-        let err = SaError::MulticallRegistryEntryNotFound {
-            network_safename: "testnet".to_owned(),
-        };
-        assert_eq!(map_sa_error_to_multicall_phase(&err), "submit");
     }
 
     // ── deny_reason_wire_code ─────────────────────────────────────────────────
