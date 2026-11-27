@@ -514,14 +514,12 @@ CI_OFF_JOBS = {
                'cargo clippy --workspace --all-targets --no-default-features --features "$FEATURES_EXCEPT_MAINNET_WRITE"'),
     "doc": ("  doc:\n    name: rustdoc\n",
             'cargo doc --workspace --no-deps --no-default-features --features "$FEATURES_EXCEPT_MAINNET_WRITE"'),
-    "test": ("  test:\n    name: test (offline)\n",
-             "cargo test --workspace --no-default-features --features test-helpers,"),
 }
 # The dependency and condition lines that skip a ci.yml job on a docs-only
 # pull request into next.
 DOCS_ONLY_JOB = ("    needs: changes\n"
                  "    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}\n")
-DOCS_ONLY_FEATURE_JOBS = ("clippy", "doc", "test", "feature-on-clippy", "feature-on-doc",
+DOCS_ONLY_FEATURE_JOBS = ("clippy", "doc", "feature-on-clippy", "feature-on-doc",
                           "release-shape")
 DOCS_TESTS_HEADER = ("  docs-tests:\n    name: docs-tests\n    needs: changes\n"
                      "    if: ${{ !cancelled() && needs.changes.outputs.docs_only == 'true' }}\n")
@@ -840,7 +838,7 @@ COVERAGE_OFF_JOB = live_text(COVERAGE, re.compile(r"^  coverage-off:\n.*?(?=^  c
                              "feature-off coverage job")
 COVERAGE_ON_CACHE = live_text(COVERAGE, re.compile(r"^  coverage-on" + JOB_CACHE, re.DOTALL | re.MULTILINE),
                               "feature-on coverage cache")
-CI_TEST_CACHE = live_text(CI, re.compile(r"^  test" + JOB_CACHE, re.DOTALL | re.MULTILINE), "test job cache")
+CI_CLIPPY_CACHE = live_text(CI, re.compile(r"^  clippy" + JOB_CACHE, re.DOTALL | re.MULTILINE), "clippy job cache")
 CI_FEATURE_ON_TEST_CACHE = live_text(CI, re.compile(r"^  feature-on-test" + JOB_CACHE.replace(" == 'push' ", " == 'push' && matrix.shard == 1 "), re.DOTALL | re.MULTILINE),
                                      "feature-on test job cache")
 
@@ -902,9 +900,9 @@ PASSING = [
     ("coverage seed branches in another order pass", [
         (COVERAGE, COVERAGE_PUSH_BLOCK, "  push:\n    branches: [main, next]\n", 1)]),
     ("save-if as a quoted expression passes", [
-        (CI, CACHE_SAVE_LINE, "          save-if: \"${{ github.event_name == 'push' }}\"\n", 5)]),
+        (CI, CACHE_SAVE_LINE, "          save-if: \"${{ github.event_name == 'push' }}\"\n", 4)]),
     ("save-if with inner spaces passes", [
-        (CI, CACHE_SAVE_LINE, "          save-if: ${{  github.event_name == 'push'  }}\n", 5)]),
+        (CI, CACHE_SAVE_LINE, "          save-if: ${{  github.event_name == 'push'  }}\n", 4)]),
     ("cancel-in-progress with inner spaces passes", [
         (COVERAGE, COVERAGE_CANCEL_LINE, "  cancel-in-progress: ${{  github.event_name == 'pull_request'  }}\n", 1)]),
     ("Wasm save guard wrapped in ${{ }} passes", [
@@ -1768,8 +1766,8 @@ CASES = [
         (COVERAGE, COVERAGE_PUSH_BLOCK, COVERAGE_PUSH_BLOCK + "    paths-ignore: ['**.md']\n", 1)]),
     ("coverage push runs cancel each other", "coverage-seed", "later runs cancel a running push", [
         (COVERAGE, COVERAGE_CANCEL_LINE, "  cancel-in-progress: true\n", 1)]),
-    ("ci test cache saves on pull requests", "cache-save-if", "ci.yml:test step 5: cache-save-if: rust-cache saves on pull request runs", [
-        (CI, CI_TEST_CACHE, CI_TEST_CACHE.replace("        with:\n" + CACHE_SAVE_LINE, ""), 1)]),
+    ("ci clippy cache saves on pull requests", "cache-save-if", "ci.yml:clippy step 4: cache-save-if: rust-cache saves on pull request runs", [
+        (CI, CI_CLIPPY_CACHE, CI_CLIPPY_CACHE.replace("        with:\n" + CACHE_SAVE_LINE, ""), 1)]),
     ("ci cache save-if always true", "cache-save-if", "ci.yml:feature-on-test step", [
         (CI, CI_FEATURE_ON_TEST_CACHE, CI_FEATURE_ON_TEST_CACHE.replace(CACHE_SAVE_LINE.replace(" == 'push' ", " == 'push' && matrix.shard == 1 "), "          save-if: true\n"), 1)]),
     ("coverage-on cache saves on pull requests", "cache-save-if", "coverage.yml:coverage-on step", [
@@ -1784,8 +1782,8 @@ CASES = [
         (CACHE_FIXTURE, CACHE_FIXTURE_TEXT, cache_fixture("[pull_request]"), 1)]),
     ("rust-cache in scalar pull_request workflow", "cache-save-if", "cache-fixture.yaml:fixture step 1", [
         (CACHE_FIXTURE, CACHE_FIXTURE_TEXT, cache_fixture("pull_request"), 1)]),
-    ("rust-cache in upper case", "cache-save-if", "ci.yml:test step", [
-        (CI, RUST_CACHE_PLAIN, RUST_CACHE_USES.replace("Swatinem/rust-cache", "swatinem/RUST-CACHE"), 3)]),
+    ("rust-cache in upper case", "cache-save-if", "ci.yml:clippy step", [
+        (CI, RUST_CACHE_PLAIN, RUST_CACHE_USES.replace("Swatinem/rust-cache", "swatinem/RUST-CACHE"), 2)]),
     ("rehearsal job with id-token: write", "rehearsal-credentials",
      "release-rehearsal.yml:build: rehearsal-credentials: the job holds id-token: write", [
         (REHEARSAL, REHEARSAL_JOB_PERMISSIONS,
@@ -2121,7 +2119,7 @@ CASES = [
     ("release-shape that continues on error", "ci-feature-jobs", "ci.yml: ci-feature-jobs: release-shape can be bypassed", [
         (CI, "  release-shape:\n    name: release-shape\n",
          "  release-shape:\n    name: release-shape\n    continue-on-error: true\n", 1)]),
-    ("conditional network forwarding check", "ci-feature-jobs", "pilot layout differs: feature-on-test-extra", [
+    ("conditional network forwarding check", "ci-feature-jobs", "test layout differs: feature-on-test-extra", [
         (CI, "        run: cargo check -p stellar-agent-network", "        if: false\n        run: cargo check -p stellar-agent-network", 1)]),
     ("feature-on clippy without mainnet-write", "ci-feature-jobs",
      "ci.yml: ci-feature-jobs: feature-on-clippy does not run unconditionally", [
@@ -2245,8 +2243,8 @@ CASES.extend((label, changelog_rule(label), CHANGELOG_MESSAGES[label], []) for l
 
 CI_RESULT_SCRIPT = ".github/scripts/ci-result.py"
 CI_RESULT_NAME = "    name: ci-result (${{ github.base_ref || github.ref_name }})\n"
-CI_RESULT_NEEDS = ("    needs: [changes, fmt, clippy, doc, test, feature-on-clippy, feature-on-doc, "
-                   "feature-on-test, feature-on-test-shadow, feature-on-test-extra, feature-on-test-compare, docs-tests, feature-discipline, release-shape, inbox-js, mpp-interop, "
+CI_RESULT_NEEDS = ("    needs: [changes, fmt, clippy, doc, test, test-extra, feature-on-clippy, feature-on-doc, "
+                   "feature-on-test, feature-on-test-extra, docs-tests, feature-discipline, release-shape, inbox-js, mpp-interop, "
                    "sdk-v17-interop, release-contracts, windows-storage, platform-keyring, deploy-scripts, machete, deny]\n")
 CI_RESULT_CHECK = "      - name: Check every CI result\n        if: always()\n"
 CI_RESULT_FIRST_CANCEL = ("      - name: Reject a cancelled run\n"
@@ -2303,7 +2301,8 @@ CASES.extend([
     ("classifier shallow checkout", "docs-classifier", "full history", [
         (COVERAGE, "          fetch-depth: 0\n", "          fetch-depth: 1\n", 1)]),
     ("docs-tests cache saves", "docs-classifier", "never save", [
-        (CI, "          shared-key: test\n          save-if: false\n", "          shared-key: test\n" + CACHE_SAVE_LINE, 1)]),
+        (CI, "          shared-key: test\n          save-if: false\n      - name: Check the documentation reads\n",
+         "          shared-key: test\n" + CACHE_SAVE_LINE + "      - name: Check the documentation reads\n", 1)]),
     ("coverage changes failure ignored", "coverage-gate", "reject failed changes", [
         (COVERAGE, '          test "$CHANGES" = success\n', "", 1)]),
     ("coverage measurement missing changes", "coverage-condition", "must need changes", [
@@ -3036,7 +3035,7 @@ MUTATIONS = {
         ["cancel-in-progress with inner spaces passes"]),
     "cache-save-if-value": (
         "if not isinstance(value, str) or self.unwrap_expression(value) != expected:", "if False:",
-        ["ci test cache saves on pull requests"]),
+        ["ci clippy cache saves on pull requests"]),
     "cache-save-if-boolean": (
         "if not isinstance(value, str) or self.unwrap_expression(value) != expected:",
         "if value is not True and (not isinstance(value, str) or self.unwrap_expression(value) != expected):",
@@ -3819,6 +3818,7 @@ MUTATIONS.update({
 
 def copy_tree(destination):
     shutil.copytree(ROOT / ".github", destination / ".github")
+    shutil.copytree(ROOT / ".config", destination / ".config")
     shutil.copy2(ROOT / "rust-toolchain.toml", destination / "rust-toolchain.toml")
     # A dispatch-only .yaml workflow that the cache-save-if cases edit; the
     # checker reads it as every other workflow outside WORKFLOWS.
@@ -3844,6 +3844,8 @@ def entry_problems(root, label, script=SCRIPT):
     if label == "S28 unknown registry group rejected":
         return registry_group_problems(script)
     copy_tree(root)
+    if label == "missing nextest configuration":
+        (root / ".config/nextest.toml").unlink()
     try:
         passing = dict(PASSING)
         if label in passing:
@@ -4112,14 +4114,14 @@ def coverage_decision(case=None):
     return problems
 
 
-# The baseline and these single-field edits pin each pilot contract.
-PILOT_BLOCKS = {
+# The baseline and these single-field edits pin each test job contract.
+TEST_BLOCKS = {
     name: live_text(CI, re.compile(r"^  " + name + r":\n.*?(?=^  (?:[a-z#])|\Z)",
                                   re.DOTALL | re.MULTILINE), name)
-    for name in ("feature-on-test", "feature-on-test-shadow", "feature-on-test-extra", "feature-on-test-compare")
+    for name in ("test", "test-extra", "feature-on-test", "feature-on-test-extra")
 }
-PASSING.append(("pilot baseline", []))
-for job, block in PILOT_BLOCKS.items():
+PASSING.append(("test-layout baseline", []))
+for job, block in TEST_BLOCKS.items():
     edits = {
         "name": block.replace("    name: " + job, "    name: renamed", 1),
         "needs": block.replace("    needs: ", "    needs: other # ", 1),
@@ -4128,74 +4130,62 @@ for job, block in PILOT_BLOCKS.items():
         "timeout": block.replace("timeout-minutes: ", "timeout-minutes: 1 # ", 1),
         "continue": block.replace("    steps:", "    continue-on-error: true\n    steps:", 1),
     }
-    if job == "feature-on-test":
+    if job in ("test", "feature-on-test"):
         edits.update({
             "matrix": block.replace("- shard: 3", "- shard: 4"),
             "matrix-type": block.replace("- shard: 1", "- shard: true"),
             "fail-fast-type": block.replace("fail-fast: false", "fail-fast: 0"),
             "fail-fast": block.replace("fail-fast: false", "fail-fast: true"),
             "pin": block.replace("cargo-nextest@0.9.152", "cargo-nextest@0.9.151"),
-            "list": block.replace("cargo nextest list", "echo nextest list"),
             "run": block.replace("--profile ci", "--profile default"),
             "cache": block.replace(" && matrix.shard == 1", ""),
-            "cache-key": block.replace("shared-key: feature-on", "shared-key: other"),
+            "cache-key": re.sub(r"shared-key: (?:feature-on|test)", "shared-key: other", block),
         })
-    if job in ("feature-on-test", "feature-on-test-shadow"):
-        edits.update({
-            "upload": block.replace("if: always()", "if: success()"),
-            "artifact-name": block.replace("name: feature-on-sh", "name: other-sh"),
-            "artifact-path": block.replace("partition.json\n", "wrong.json\n") if job == "feature-on-test"
-                             else block.replace("            shadow.json", "            wrong.json"),
-            "artifact-overwrite": block.replace("overwrite: true", "overwrite: false"),
-            "artifact-missing": block.replace("if-no-files-found: error", "if-no-files-found: warn"),
-        })
-    if job in ("feature-on-test-shadow", "feature-on-test-extra"):
+    if job in ("test-extra", "feature-on-test-extra"):
         edits["restore-only"] = block.replace("save-if: false", "save-if: true")
         edits["command"] = block.replace("run: cargo test", "run: echo cargo test", 1)
-    if job == "feature-on-test-shadow":
-        edits["capture"] = block.replace("--no-run --message-format json", "--no-run")
-        edits["lists"] = block.replace("--capture cargo-tests.jsonl shadow.json", "--capture other.jsonl shadow.json")
+        edits["cache-key"] = re.sub(r"shared-key: (?:feature-on|test)", "shared-key: other", block)
+    if job == "test-extra":
+        for label, needle in (("proof", "--configuration feature-off"), ("friendbot", "--features testnet-helpers"),
+                              ("wasm", "--test vendored_wasm_release_cfg"), ("policy", "--doc policy::pin"),
+                              ("feature-sets", 'for feature in test-helpers')):
+            edits[label] = block.replace(needle, needle + "-wrong")
     if job == "feature-on-test-extra":
         edits["network"] = block.replace("cargo check", "echo cargo check")
         edits["proof"] = block.replace("--configuration feature-on", "--configuration feature-off")
-    if job == "feature-on-test-compare":
-        edits["guard"] = block.replace('test "$SHARDS_RESULT" = success', "true")
-        edits["guard-env"] = block.replace("needs.feature-on-test-shadow.result", "needs.feature-on-test.result")
-        edits["download"] = block.replace("pattern: feature-on-*", "pattern: other-*")
-        edits["compare"] = block.replace("compare-test-runs.py test-runs", "compare-test-runs.py other")
     for rule, edited in edits.items():
         assert edited != block, (job, rule)
-        CASES.append((f"pilot {job} {rule}", "ci-feature-jobs", f"pilot layout differs: {job}",
+        CASES.append((f"test-layout {job} {rule}", "ci-feature-jobs", f"test layout differs: {job}",
                       [(CI, block, edited, 1)]))
-MUTATIONS["pilot-layout"] = (
-    'if actual != expected:\n                self.report("ci.yml", "ci-feature-jobs", f"pilot layout differs: {name}")',
-    'if False:\n                self.report("ci.yml", "ci-feature-jobs", f"pilot layout differs: {name}")',
-    [case[0] for case in CASES if case[0].startswith("pilot ")])
-MUTATIONS["pilot-baseline"] = (
-    'if actual != expected:\n                self.report("ci.yml", "ci-feature-jobs", f"pilot layout differs: {name}")',
-    'if True:\n                self.report("ci.yml", "ci-feature-jobs", f"pilot layout differs: {name}")',
-    ["pilot baseline"])
-MUTATIONS["pilot-scalar-types"] = (
+MUTATIONS["test-layout-layout"] = (
+    'if actual != expected:\n                self.report("ci.yml", "ci-feature-jobs", f"test layout differs: {name}")',
+    'if False:\n                self.report("ci.yml", "ci-feature-jobs", f"test layout differs: {name}")',
+    [case[0] for case in CASES if case[0].startswith("test-layout ")])
+MUTATIONS["test-layout-baseline"] = (
+    'if actual != expected:\n                self.report("ci.yml", "ci-feature-jobs", f"test layout differs: {name}")',
+    'if True:\n                self.report("ci.yml", "ci-feature-jobs", f"test layout differs: {name}")',
+    ["test-layout baseline"])
+MUTATIONS["test-layout-scalar-types"] = (
     'actual = yaml.safe_dump(self.job("ci.yml", name), sort_keys=True)\n            expected = yaml.safe_dump(expected, sort_keys=True)',
     'actual = self.job("ci.yml", name)',
-    ["pilot feature-on-test matrix-type", "pilot feature-on-test fail-fast-type"])
+    ["test-layout feature-on-test matrix-type", "test-layout feature-on-test fail-fast-type"])
 
 
 SHARD_SAVE_LINE = CACHE_SAVE_LINE.replace(" == 'push' ", " == 'push' && matrix.shard == 1 ")
-CASES.append(("pilot cache other workflow", "cache-save-if", "rust-cache saves on pull request runs", [
+CASES.append(("test-layout cache other workflow", "cache-save-if", "rust-cache saves on pull request runs", [
     (CACHE_FIXTURE, CACHE_FIXTURE_TEXT,
      cache_fixture("[pull_request]").replace("  fixture:", "  feature-on-test:").replace(
          UNGUARDED_CACHE_STEP, UNGUARDED_CACHE_STEP + "        with:\n" + SHARD_SAVE_LINE), 1)]))
-CASES.append(("pilot cache other job", "cache-save-if", "ci.yml:test step", [
-    (CI, CI_TEST_CACHE, CI_TEST_CACHE.replace(CACHE_SAVE_LINE, SHARD_SAVE_LINE), 1)]))
-MUTATIONS["pilot-cache-workflow"] = (
-    'if source.name == "ci.yml" and name == "feature-on-test"',
-    'if name == "feature-on-test"', ["pilot cache other workflow"])
-MUTATIONS["pilot-cache-job"] = (
-    'if source.name == "ci.yml" and name == "feature-on-test"',
-    'if source.name == "ci.yml"', ["pilot cache other job"])
-MUTATIONS["pilot-cache-value"] = (
-    'CACHE_SAVE_CONDITION + " && matrix.shard == 1"', 'CACHE_SAVE_CONDITION', ["pilot baseline"])
+CASES.append(("test-layout cache other job", "cache-save-if", "ci.yml:clippy step", [
+    (CI, CI_CLIPPY_CACHE, CI_CLIPPY_CACHE.replace(CACHE_SAVE_LINE, SHARD_SAVE_LINE), 1)]))
+MUTATIONS["test-layout-cache-workflow"] = (
+    'if source.name == "ci.yml" and name in ("test", "feature-on-test")',
+    'if name in ("test", "feature-on-test")', ["test-layout cache other workflow"])
+MUTATIONS["test-layout-cache-job"] = (
+    'if source.name == "ci.yml" and name in ("test", "feature-on-test")',
+    'if source.name == "ci.yml"', ["test-layout cache other job"])
+MUTATIONS["test-layout-cache-value"] = (
+    'CACHE_SAVE_CONDITION + " && matrix.shard == 1"', 'CACHE_SAVE_CONDITION', ["test-layout baseline"])
 
 
 for name in ("feature-on-clippy", "feature-on-doc"):
@@ -4203,27 +4193,27 @@ for name in ("feature-on-clippy", "feature-on-doc"):
     for label, changed in (
             ("key", block.replace("shared-key: feature-on", "shared-key: other")),
             ("writer", block.replace("save-if: false", "save-if: ${{ github.event_name == 'push' }}"))):
-        CASES.append((f"pilot {name} cache {label}", "cache-save-if", "must only restore the shared cache",
+        CASES.append((f"test-layout {name} cache {label}", "cache-save-if", "must only restore the shared cache",
                       [(CI, block, changed, 1)]))
-MUTATIONS["pilot-lint-doc-cache"] = (
+MUTATIONS["test-layout-lint-doc-cache"] = (
     'if (step.get("with") or {}).get("shared-key") != "feature-on" or value is not False:',
-    'if False:', [f"pilot {name} cache {label}" for name in ("feature-on-clippy", "feature-on-doc")
+    'if False:', [f"test-layout {name} cache {label}" for name in ("feature-on-clippy", "feature-on-doc")
                   for label in ("key", "writer")])
 
 
-PASSING.append(("pilot lint cache other workflow", [
+PASSING.append(("test-layout lint cache other workflow", [
     (CACHE_FIXTURE, CACHE_FIXTURE_TEXT,
      cache_fixture("[pull_request]").replace("  fixture:", "  feature-on-doc:").replace(
          UNGUARDED_CACHE_STEP, UNGUARDED_CACHE_STEP + "        with:\n          save-if: false\n"), 1)]))
-MUTATIONS["pilot-lint-cache-scope"] = (
+MUTATIONS["test-layout-lint-cache-scope"] = (
     'if source.name == "ci.yml" and name in ("feature-on-clippy", "feature-on-doc"):',
-    'if name in ("feature-on-clippy", "feature-on-doc"):', ["pilot lint cache other workflow"])
-MUTATIONS["pilot-lint-cache-key"] = (
+    'if name in ("feature-on-clippy", "feature-on-doc"):', ["test-layout lint cache other workflow"])
+MUTATIONS["test-layout-lint-cache-key"] = (
     'if (step.get("with") or {}).get("shared-key") != "feature-on" or value is not False:',
-    'if value is not False:', ["pilot feature-on-clippy cache key"])
-MUTATIONS["pilot-lint-cache-writer"] = (
+    'if value is not False:', ["test-layout feature-on-clippy cache key"])
+MUTATIONS["test-layout-lint-cache-writer"] = (
     'if (step.get("with") or {}).get("shared-key") != "feature-on" or value is not False:',
-    'if (step.get("with") or {}).get("shared-key") != "feature-on":', ["pilot feature-on-doc cache writer"])
+    'if (step.get("with") or {}).get("shared-key") != "feature-on":', ["test-layout feature-on-doc cache writer"])
 
 
 for name in ("feature-on-clippy", "feature-on-doc"):
@@ -4231,12 +4221,33 @@ for name in ("feature-on-clippy", "feature-on-doc"):
     cache = live_text(CI, re.compile(r"^  " + name + r":\n.*?(?=^  [a-z])", re.M | re.S), name)
     cache = re.search(r"      - uses: Swatinem/rust-cache@.*?          save-if: false\n", cache, re.S)[0]
     for label, value in (("missing", ""), ("duplicate", cache + cache)):
-        CASES.append((f"pilot {name} cache {label}", "cache-save-if", "must have one shared cache restore",
+        CASES.append((f"test-layout {name} cache {label}", "cache-save-if", "must have one shared cache restore",
                       [(CI, block, block.replace(cache, value), 1)]))
-MUTATIONS["pilot-lint-cache-count"] = (
+MUTATIONS["test-layout-lint-cache-count"] = (
     "if len(caches) != 1:", "if False:",
-    [f"pilot {name} cache {label}" for name in ("feature-on-clippy", "feature-on-doc")
+    [f"test-layout {name} cache {label}" for name in ("feature-on-clippy", "feature-on-doc")
      for label in ("missing", "duplicate")])
+
+
+CASES.append(("missing nextest configuration", "ci-feature-jobs", "cannot be read", [], 1))
+MUTATIONS["nextest-profile-missing"] = (
+    "if profile is not None and profile != NEXTEST_PROFILE:",
+    "if profile != NEXTEST_PROFILE:", ["missing nextest configuration"])
+
+NEXTEST_CONFIG = ".config/nextest.toml"
+for label, old, new in (
+        ("fail-fast", "fail-fast = false", "fail-fast = true"),
+        ("retries", "retries = 0", "retries = 1"),
+        ("group", "[test-groups]", "[test-groups.serial]\nmax-threads = 1"),
+        ("comment", "# Tests that share", "# Suites that share"),
+        ("extra-table", "[profile.ci]", "[profile.dev]\nretries = 0\n\n[profile.ci]")):
+    CASES.append((f"nextest profile {label}", "ci-feature-jobs", "nextest profile differs",
+                  [(NEXTEST_CONFIG, old, new, 1)]))
+MUTATIONS["nextest-profile"] = (
+    "if profile is not None and profile != NEXTEST_PROFILE:", "if False:",
+    [case[0] for case in CASES if case[0].startswith("nextest profile ")])
+MUTATIONS["nextest-profile-baseline"] = (
+    "if profile is not None and profile != NEXTEST_PROFILE:", "if True:", ["test-layout baseline"])
 
 
 def main():

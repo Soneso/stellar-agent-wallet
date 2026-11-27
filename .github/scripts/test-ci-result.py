@@ -29,16 +29,21 @@ def dispatch_docs_only():
 
 
 def main():
-    pilot = {"feature-on-test-shadow", "feature-on-test-extra", "feature-on-test-compare"}
-    assert pilot <= module.EXPECTED_JOBS, "pilot jobs missing from aggregate"
+    sharded = {"test", "test-extra", "feature-on-test", "feature-on-test-extra"}
+    assert module.EXPECTED_JOBS == {
+        "changes", "fmt", "clippy", "doc", "test", "test-extra", "feature-on-clippy",
+        "feature-on-doc", "feature-on-test", "feature-on-test-extra", "docs-tests",
+        "feature-discipline", "release-shape", "inbox-js", "mpp-interop", "sdk-v17-interop",
+        "release-contracts", "windows-storage", "platform-keyring", "deploy-scripts", "machete", "deny",
+    }, "final jobs differ from aggregate"
     full = {job: {"result": "skipped" if job == "docs-tests" else "success"}
             for job in module.EXPECTED_JOBS}
     docs = {job: {"result": "success" if job in DOCS_REQUIRED else "skipped"}
             for job in module.EXPECTED_JOBS}
     cases = [("docs-only success", docs, "true", 0), ("full success", full, "false", 0)]
-    for job in sorted(pilot):
+    for job in sorted(sharded):
         for result in ("failure", "cancelled", "skipped"):
-            cases.append((f"pilot {job} {result}", dict(full, **{job: {"result": result}}), "false", 1))
+            cases.append((f"sharded {job} {result}", dict(full, **{job: {"result": result}}), "false", 1))
     for job in sorted(DOCS_REQUIRED):
         cases.append((f"docs required {job} skipped", dict(docs, **{job: {"result": "skipped"}}), "true", 1))
     for label, base, mode, job, result in [

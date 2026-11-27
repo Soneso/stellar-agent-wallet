@@ -225,8 +225,7 @@ dependencies. The archive checks run on a runner of each release target, and
 the rehearsal packages with the toolchain that `publish.yml` packages with.
 In `ci.yml`, `feature-discipline` runs unless cancelled. The other feature jobs
 also skip documentation-only pull requests and pushes into `next`, where
-`docs-tests` runs instead. Each job runs its defining commands unconditionally;
-pilot evidence uploads run under `always()`.
+`docs-tests` runs instead. Each job runs its defining commands unconditionally.
 
 The `release-cache` rule refuses cache actions in the release and rehearsal.
 Both build cold from locked sources. The `release-toolchain` rule requires
@@ -574,9 +573,8 @@ Package and install inventory rows use these marker checks as their evidence.
 They require no graph claim about registry sources.
 
 The `ci-result` aggregate requires `feature-on-clippy`, `feature-on-doc`,
-`feature-discipline`, and `release-shape`, along with the feature-on pilot:
-`feature-on-test` shards, `feature-on-test-shadow`, `feature-on-test-extra`,
-and `feature-on-test-compare`. The `coverage` required check
+`feature-discipline`, and `release-shape`, along with both test matrices:
+the `test` and `feature-on-test` shards, `test-extra`, and `feature-on-test-extra`. The `coverage` required check
 needs both coverage measurement jobs and enforces the floors of both feature
 configurations when measurement is required.
 Opening, pushing to, or reopening a pull request evaluates coverage.

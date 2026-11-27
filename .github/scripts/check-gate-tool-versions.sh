@@ -26,7 +26,7 @@ ACTION_DIR="$ROOT/.github/actions"
 BUILDING_DOC="$ROOT/docs/maintainers/building.md"
 
 # Each gate tool, the workflow that holds its reference pins, and their count.
-TOOLS=(cargo-llvm-cov=coverage.yml:2 cargo-machete=ci.yml:1 cargo-deny=ci.yml:1 cargo-nextest=ci.yml:1)
+TOOLS=(cargo-llvm-cov=coverage.yml:2 cargo-machete=ci.yml:1 cargo-deny=ci.yml:1 cargo-nextest=ci.yml:2)
 VERSION_RE='([0-9][0-9A-Za-z.+-]*)'
 FAILED=0
 

@@ -12,7 +12,8 @@ under ``.github/workflows/``.
 Also reads the composite action
 ``.github/actions/macos-sign-notarize/action.yml``, the shared build script
 ``.github/scripts/release/build.sh``, and the host recipe
-``.github/scripts/release/check-host.sh``. Toolchain checks read
+``.github/scripts/release/check-host.sh``. The CI profile check reads
+``.config/nextest.toml``. Toolchain checks read
 ``rust-toolchain.toml``, every ``*.yml`` and ``*.yaml`` workflow, and every
 ``action.yml`` under ``.github/actions/``. Needs Python 3.11 or later and PyYAML.
 
@@ -131,7 +132,7 @@ The check fails when any of these holds:
   any ``*.yml`` or ``*.yaml`` workflow that ``pull_request`` or
   ``pull_request_target`` triggers lacks ``save-if`` equal to
   ``CACHE_SAVE_CONDITION`` after the check strips one enclosing ``${{ }}``, or boolean ``false``.
-  Only ci.yml's feature-on-test accepts the additional matrix.shard == 1 condition.
+  Only ci.yml's test and feature-on-test accept the additional matrix.shard == 1 condition.
   Feature-on clippy and rustdoc jobs must only restore the shared feature-on cache.
 - ``ci-result``: the aggregate lacks its base-specific name, complete dependencies,
   matching script job set, cancellation guard, always-run result check, or exact environment.
@@ -281,8 +282,9 @@ runs the function.
   a workflow or local action installs another toolchain, or a release workflow
   does not use its matching ``RELEASE_TOOLCHAIN`` value. Toolchain overrides
   are forbidden except in ``vendored-wasm.yml`` and the release pin line.
-- ``ci-feature-jobs``: a pilot job differs from FEATURE_PILOT_JOBS, including
-  shard membership, setup, producer success guards, and always-run evidence uploads.
+- ``ci-feature-jobs``: a test job differs from CI_TEST_JOBS, including
+  shard membership, setup, cache policy, doctests, and auxiliary commands.
+  The nextest configuration must equal NEXTEST_PROFILE, including its group comment.
   Or a job of ``CI_FEATURE_JOBS`` is missing, it or one of
   its steps has an unsupported condition or sets ``continue-on-error``, or
   it does not run each of its commands. The ``feature-discipline`` job needs
@@ -761,7 +763,6 @@ SELFTESTS = {
         "python3 .github/scripts/test-classify-docs-only.py": "scripts",
         "python3 .github/scripts/test-classify-self-tests.py": "scripts",
         "python3 .github/scripts/test-ci-result.py": "scripts",
-        "python3 .github/scripts/test-compare-test-runs.py": "scripts",
         "python3 .github/scripts/test-check-run-evidence.py --mutations": "scripts",
         "python3 .github/scripts/test-check-docs-reads.py": "scripts",
         "python3 .github/scripts/test-validate-unsigned-archive.py": "scripts",
@@ -781,8 +782,79 @@ SELFTESTS = {
     },
 }
 
-# Reviewed pilot jobs: names, setup, partitions, evidence and producer guards.
-FEATURE_PILOT_JOBS = {'feature-on-test': {'name': 'feature-on-test (${{ matrix.shard }}/3)',
+# Reviewed test jobs: names, setup, partitions, doctests and auxiliary checks.
+CI_TEST_JOBS = {'test': {'name': 'test (${{ matrix.shard }}/3)',
+          'strategy': {'fail-fast': False, 'matrix': {'include': [{'shard': 1}, {'shard': 2}, {'shard': 3}]}},
+          'needs': 'changes',
+          'if': "${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}",
+          'runs-on': 'ubuntu-24.04',
+          'timeout-minutes': 90,
+          'env': {'CARGO_PROFILE_TEST_DEBUG': '0'},
+          'steps': [{'uses': 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1',
+                     'with': {'persist-credentials': False}},
+                    {'name': 'Free disk space',
+                     'run': 'sudo rm -rf /usr/share/dotnet\n'
+                            'sudo rm -rf /usr/local/lib/android\n'
+                            'sudo rm -rf /opt/ghc\n'
+                            'sudo rm -rf /opt/hostedtoolcache/CodeQL\n'
+                            'sudo docker image prune --all --force >/dev/null 2>&1 || true\n'},
+                    {'uses': 'dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8',
+                     'with': {'toolchain': '1.100.0'}},
+                    {'name': 'Install libudev (Linux hidapi)',
+                     'run': 'sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 '
+                            'install -y libudev-dev pkg-config'},
+                    {'uses': 'Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0',
+                     'with': {'shared-key': 'test',
+                              'save-if': "${{ github.event_name == 'push' && matrix.shard == 1 }}"}},
+                    {'uses': 'taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c',
+                     'with': {'tool': 'cargo-nextest@0.9.152'}},
+                    {'name': 'Run the shard tests',
+                     'run': 'cargo nextest run --workspace --no-default-features --features '
+                            'test-helpers,test-hooks,test-loopback,verifier-registry --partition count:${{ '
+                            'matrix.shard }}/3 --profile ci'}]},
+ 'test-extra': {'name': 'test-extra',
+                'needs': 'changes',
+                'if': "${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}",
+                'runs-on': 'ubuntu-24.04',
+                'timeout-minutes': 90,
+                'env': {'CARGO_PROFILE_TEST_DEBUG': '0'},
+                'steps': [{'uses': 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1',
+                           'with': {'persist-credentials': False}},
+                          {'name': 'Free disk space',
+                           'run': 'sudo rm -rf /usr/share/dotnet\n'
+                                  'sudo rm -rf /usr/local/lib/android\n'
+                                  'sudo rm -rf /opt/ghc\n'
+                                  'sudo rm -rf /opt/hostedtoolcache/CodeQL\n'
+                                  'sudo docker image prune --all --force >/dev/null 2>&1 || true\n'},
+                          {'uses': 'dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8',
+                           'with': {'toolchain': '1.100.0'}},
+                          {'name': 'Install libudev (Linux hidapi)',
+                           'run': 'sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o '
+                                  'Acquire::Retries=3 install -y libudev-dev pkg-config'},
+                          {'uses': 'Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0',
+                           'with': {'shared-key': 'test', 'save-if': False}},
+                          {'name': 'Run the offline doctests',
+                           'run': 'cargo test --workspace --no-default-features --features '
+                                  'test-helpers,test-hooks,test-loopback,verifier-registry --doc'},
+                          {'name': 'Check the proof matrix',
+                           'run': 'python3 .github/scripts/check-proof-matrix.py --configuration feature-off '
+                                  '--workspace'},
+                          {'name': 'Run the test-support Friendbot unit tests',
+                           'run': 'cargo test -p stellar-agent-test-support --no-default-features --features '
+                                  'testnet-helpers --lib'},
+                          {'name': 'Test the vendored Wasm release configuration',
+                           'run': 'cargo test -p stellar-agent-smart-account --test '
+                                  'vendored_wasm_release_cfg'},
+                          {'name': 'Test the policy pin release configuration',
+                           'run': 'cargo test -p stellar-agent-core --doc policy::pin'},
+                          {'name': 'Check each test-support feature set',
+                           'run': 'cargo check -p stellar-agent-test-support --no-default-features\n'
+                                  'for feature in test-helpers testnet-helpers verifier-registry '
+                                  'wiremock-helpers; do\n'
+                                  '  cargo check -p stellar-agent-test-support --no-default-features '
+                                  '--features "$feature"\n'
+                                  'done\n'}]},
+ 'feature-on-test': {'name': 'feature-on-test (${{ matrix.shard }}/3)',
                      'strategy': {'fail-fast': False,
                                   'matrix': {'include': [{'shard': 1}, {'shard': 2}, {'shard': 3}]}},
                      'needs': 'changes',
@@ -809,59 +881,10 @@ FEATURE_PILOT_JOBS = {'feature-on-test': {'name': 'feature-on-test (${{ matrix.s
                                                     '}}'}},
                                {'uses': 'taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c',
                                 'with': {'tool': 'cargo-nextest@0.9.152'}},
-                               {'name': 'List the shard tests',
-                                'run': 'cargo nextest list --workspace --features '
-                                       'mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry '
-                                       '--partition count:${{ matrix.shard }}/3 --message-format json > '
-                                       'partition.json'},
                                {'name': 'Run the shard tests',
                                 'run': 'cargo nextest run --workspace --features '
                                        'mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry '
-                                       '--partition count:${{ matrix.shard }}/3 --profile ci'},
-                               {'uses': 'actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9',
-                                'if': 'always()',
-                                'with': {'name': 'feature-on-shard-${{ matrix.shard }}',
-                                         'overwrite': True,
-                                         'if-no-files-found': 'error',
-                                         'path': 'partition.json\ntarget/nextest/ci/junit.xml\n'}}]},
- 'feature-on-test-shadow': {'name': 'feature-on-test-shadow',
-                            'needs': 'changes',
-                            'if': "${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}",
-                            'runs-on': 'ubuntu-24.04',
-                            'timeout-minutes': 90,
-                            'env': {'CARGO_PROFILE_TEST_DEBUG': '0'},
-                            'steps': [{'uses': 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1',
-                                       'with': {'persist-credentials': False}},
-                                      {'name': 'Free disk space',
-                                       'run': 'sudo rm -rf /usr/share/dotnet\n'
-                                              'sudo rm -rf /usr/local/lib/android\n'
-                                              'sudo rm -rf /opt/ghc\n'
-                                              'sudo rm -rf /opt/hostedtoolcache/CodeQL\n'
-                                              'sudo docker image prune --all --force >/dev/null 2>&1 || '
-                                              'true\n'},
-                                      {'uses': 'dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8',
-                                       'with': {'toolchain': '1.100.0'}},
-                                      {'name': 'Install libudev (Linux hidapi)',
-                                       'run': 'sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o '
-                                              'Acquire::Retries=3 install -y libudev-dev pkg-config'},
-                                      {'uses': 'Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0',
-                                       'with': {'shared-key': 'feature-on', 'save-if': False}},
-                                      {'name': 'Run the offline tests',
-                                       'run': 'cargo test --workspace --features '
-                                              'mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry'},
-                                      {'name': 'Capture test executables',
-                                       'run': 'cargo test --workspace --features '
-                                              'mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry '
-                                              '--no-run --message-format json > cargo-tests.jsonl'},
-                                      {'name': 'List the shadow tests',
-                                       'run': 'python3 .github/scripts/compare-test-runs.py --capture '
-                                              'cargo-tests.jsonl shadow.json'},
-                                      {'uses': 'actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9',
-                                       'if': 'always()',
-                                       'with': {'name': 'feature-on-shadow',
-                                                'overwrite': True,
-                                                'if-no-files-found': 'error',
-                                                'path': 'cargo-tests.jsonl\nshadow.json\n'}}]},
+                                       '--partition count:${{ matrix.shard }}/3 --profile ci'}]},
  'feature-on-test-extra': {'name': 'feature-on-test-extra',
                            'needs': 'changes',
                            'if': "${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}",
@@ -892,32 +915,15 @@ FEATURE_PILOT_JOBS = {'feature-on-test': {'name': 'feature-on-test (${{ matrix.s
                                       'run': 'cargo check -p stellar-agent-network --features mainnet-write'},
                                      {'name': 'Check the proof matrix',
                                       'run': 'python3 .github/scripts/check-proof-matrix.py --configuration '
-                                             'feature-on --workspace'}]},
- 'feature-on-test-compare': {'name': 'feature-on-test-compare',
-                             'needs': ['changes', 'feature-on-test', 'feature-on-test-shadow'],
-                             'if': "${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}",
-                             'runs-on': 'ubuntu-24.04',
-                             'timeout-minutes': 10,
-                             'steps': [{'uses': 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1',
-                                        'with': {'persist-credentials': False}},
-                                       {'name': 'Require successful producers',
-                                        'env': {'SHARDS_RESULT': '${{ needs.feature-on-test.result }}',
-                                                'SHADOW_RESULT': '${{ needs.feature-on-test-shadow.result '
-                                                                 '}}'},
-                                        'run': 'test "$SHARDS_RESULT" = success && test "$SHADOW_RESULT" = '
-                                               'success'},
-                                       {'uses': 'actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333',
-                                        'with': {'pattern': 'feature-on-*', 'path': 'test-runs'}},
-                                       {'name': 'Compare the test runs',
-                                        'run': 'python3 .github/scripts/compare-test-runs.py test-runs'}]}}
+                                             'feature-on --workspace'}]}}
+
+NEXTEST_PROFILE = "[profile.ci]\nfail-fast = false\nretries = 0\n\n[test-groups]\n# Tests that share a file path or a port across processes join a group with\n# max-threads = 1. The maintainer adds members from a measured run.\n"
 
 CI_FEATURE_JOBS = {
     "clippy": (
         'cargo clippy --workspace --all-targets --no-default-features --features "$FEATURES_EXCEPT_MAINNET_WRITE" '
         '-- -D warnings',),
     "doc": ('cargo doc --workspace --no-deps --no-default-features --features "$FEATURES_EXCEPT_MAINNET_WRITE"',),
-    "test": (
-        "cargo test --workspace --no-default-features --features test-helpers,test-hooks,test-loopback,verifier-registry",),
     "feature-on-clippy": (
         'cargo clippy --workspace --all-targets --features "mainnet-write,$FEATURES_EXCEPT_MAINNET_WRITE" '
         '-- -D warnings',),
@@ -936,8 +942,8 @@ CI_FEATURE_JOBS = {
 # DOCS_ONLY_CONDITION. On such a pull request the docs-tests job runs under
 # DOCS_TESTS_CONDITION instead and runs DOCS_TESTS_COMMANDS: the documentation
 # read check and the registry tests in the feature states of test and
-# feature-on-test-shadow.
-DOCS_ONLY_SKIPPED_JOBS = ("clippy", "doc", "test", "feature-on-clippy", "feature-on-doc",
+# feature-on-test.
+DOCS_ONLY_SKIPPED_JOBS = ("clippy", "doc", "feature-on-clippy", "feature-on-doc",
                           "release-shape")
 DOCS_ONLY_CONDITION = "!cancelled() && needs.changes.outputs.docs_only != 'true'"
 DOCS_TESTS_JOB = "docs-tests"
@@ -1621,7 +1627,7 @@ class Checker:
                     if value is False:
                         continue
                     expected = (CACHE_SAVE_CONDITION + " && matrix.shard == 1"
-                                if source.name == "ci.yml" and name == "feature-on-test"
+                                if source.name == "ci.yml" and name in ("test", "feature-on-test")
                                 else CACHE_SAVE_CONDITION)
                     if not isinstance(value, str) or self.unwrap_expression(value) != expected:
                         self.report(f"{source.name}:{name} step {index + 1}", "cache-save-if",
@@ -2412,17 +2418,20 @@ class Checker:
         self.check_credential_expressions(f"{workflow}:preflight", {"preflight": scanned, **inherited}, rule)
 
     def check_ci_feature_jobs(self):
+        profile = self.read_script(pathlib.Path(".config/nextest.toml"), "ci-feature-jobs")
+        if profile is not None and profile != NEXTEST_PROFILE:
+            self.report(".config/nextest.toml", "ci-feature-jobs", "nextest profile differs")
         for name in ("feature-on-clippy", "feature-on-doc"):
             cache_job = self.job("ci.yml", name) or {}
             caches = [step for step in cache_job.get("steps", [])
                       if RUST_CACHE_ACTION.match(str(step.get("uses") or ""))]
             if len(caches) != 1:
                 self.report("ci.yml", "cache-save-if", f"{name} must have one shared cache restore")
-        for name, expected in FEATURE_PILOT_JOBS.items():
+        for name, expected in CI_TEST_JOBS.items():
             actual = yaml.safe_dump(self.job("ci.yml", name), sort_keys=True)
             expected = yaml.safe_dump(expected, sort_keys=True)
             if actual != expected:
-                self.report("ci.yml", "ci-feature-jobs", f"pilot layout differs: {name}")
+                self.report("ci.yml", "ci-feature-jobs", f"test layout differs: {name}")
         for name, commands in CI_FEATURE_JOBS.items():
             job = self.job("ci.yml", name)
             if job is None:
