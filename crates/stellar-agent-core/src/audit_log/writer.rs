@@ -11929,47 +11929,51 @@ mod tests {
 
     // ── is_rotated_sibling unit tests ────────────────────────────────────────
 
-    /// Accept: 8-digit date + T + 6-digit time (second precision).
+    /// `is_rotated_sibling` accepts second-precision, millisecond-precision, and
+    /// numeric millisecond-collision archive names, and rejects sidecars,
+    /// unrelated prefixes, and malformed timestamps.
     #[test]
-    fn is_rotated_sibling_accepts_second_precision() {
-        assert!(is_rotated_sibling(
-            "audit.jsonl",
-            "audit.jsonl.20260428T123456"
-        ));
-    }
+    fn is_rotated_sibling_matches_expected_archive_names() {
+        const CASES: &[(&str, &str, bool)] = &[
+            ("second_precision", "audit.jsonl.20260428T123456", true),
+            ("ms_precision", "audit.jsonl.20260428T123456789", true),
+            (
+                "ms_collision_suffix",
+                "audit.jsonl.20260428T123456789-1",
+                true,
+            ),
+            (
+                "second_precision_collision_suffix",
+                "audit.jsonl.20260428T123456-1",
+                false,
+            ),
+            (
+                "nonnumeric_collision_suffix",
+                "audit.jsonl.20260428T123456789-a",
+                false,
+            ),
+            ("too_few_suffix_digits", "audit.jsonl.20260428T1", false),
+            (
+                "too_many_suffix_digits",
+                "audit.jsonl.20260428T12345678901234",
+                false,
+            ),
+            ("root_hmac_sidecar", "audit.jsonl.root_hmac", false),
+            ("unrelated_prefix", "other.jsonl.20260428T123456", false),
+            ("active_file", "audit.jsonl", false),
+            ("no_extension", "audit", false),
+            ("short_suffix", "audit.jsonl.2026042", false),
+            ("no_t_separator", "audit.jsonl.20260428", false),
+            ("seven_digit_time", "audit.jsonl.20260428T1234567", false),
+        ];
 
-    /// Accept: 8-digit date + T + 9-digit time (millisecond precision,
-    /// as produced by compact_timestamp()).
-    #[test]
-    fn is_rotated_sibling_accepts_ms_precision() {
-        assert!(is_rotated_sibling(
-            "audit.jsonl",
-            "audit.jsonl.20260428T123456789"
-        ));
-    }
-
-    #[test]
-    fn is_rotated_sibling_accepts_ms_collision_suffix() {
-        assert!(is_rotated_sibling(
-            "audit.jsonl",
-            "audit.jsonl.20260428T123456789-1"
-        ));
-    }
-
-    #[test]
-    fn is_rotated_sibling_rejects_second_precision_collision_suffix() {
-        assert!(!is_rotated_sibling(
-            "audit.jsonl",
-            "audit.jsonl.20260428T123456-1"
-        ));
-    }
-
-    #[test]
-    fn is_rotated_sibling_rejects_nonnumeric_collision_suffix() {
-        assert!(!is_rotated_sibling(
-            "audit.jsonl",
-            "audit.jsonl.20260428T123456789-a"
-        ));
+        for &(case, candidate, expected) in CASES {
+            assert_eq!(
+                is_rotated_sibling("audit.jsonl", candidate),
+                expected,
+                "case {case}: candidate {candidate:?}"
+            );
+        }
     }
 
     /// The next archive suffix sorts strictly after the newest archive's and
@@ -12040,68 +12044,9 @@ mod tests {
         assert_eq!(taken[11], "20260101T120000500-000011");
     }
 
-    /// Reject: only 1 digit after T — too short.
-    #[test]
-    fn is_rotated_sibling_rejects_too_few_suffix_digits() {
-        assert!(!is_rotated_sibling("audit.jsonl", "audit.jsonl.20260428T1"));
-    }
-
-    /// Reject: 14 digits after T — too long (would collide with future ns precision).
-    #[test]
-    fn is_rotated_sibling_rejects_too_many_suffix_digits() {
-        assert!(!is_rotated_sibling(
-            "audit.jsonl",
-            "audit.jsonl.20260428T12345678901234"
-        ));
-    }
-
     #[test]
     fn is_rotated_sibling_rejects_lock_sidecar() {
         assert!(!is_rotated_sibling("audit.jsonl", "audit.jsonl.lock"));
-    }
-
-    #[test]
-    fn is_rotated_sibling_rejects_root_hmac_sidecar() {
-        assert!(!is_rotated_sibling("audit.jsonl", "audit.jsonl.root_hmac"));
-    }
-
-    #[test]
-    fn is_rotated_sibling_rejects_unrelated_prefix() {
-        assert!(!is_rotated_sibling(
-            "audit.jsonl",
-            "other.jsonl.20260428T123456"
-        ));
-    }
-
-    #[test]
-    fn is_rotated_sibling_rejects_active_file() {
-        assert!(!is_rotated_sibling("audit.jsonl", "audit.jsonl"));
-    }
-
-    #[test]
-    fn is_rotated_sibling_rejects_no_extension() {
-        assert!(!is_rotated_sibling("audit.jsonl", "audit"));
-    }
-
-    #[test]
-    fn is_rotated_sibling_rejects_short_suffix() {
-        // Only 7 digits after stem — need 8 + 'T' + 6 or 9 digits.
-        assert!(!is_rotated_sibling("audit.jsonl", "audit.jsonl.2026042"));
-    }
-
-    #[test]
-    fn is_rotated_sibling_rejects_no_t_separator() {
-        // 8 digits but no 'T'.
-        assert!(!is_rotated_sibling("audit.jsonl", "audit.jsonl.20260428"));
-    }
-
-    /// Reject: 7 digits after T (not 6 or 9).
-    #[test]
-    fn is_rotated_sibling_rejects_7_digit_time() {
-        assert!(!is_rotated_sibling(
-            "audit.jsonl",
-            "audit.jsonl.20260428T1234567"
-        ));
     }
 
     /// A 15-byte and an 18-byte suffix whose byte 8 falls inside a two-byte

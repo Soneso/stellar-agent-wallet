@@ -261,7 +261,7 @@ mod tests {
     fn hostile_inner() -> keyring_core::error::PlatformError {
         Box::new(HostileInner)
     }
-    fn assert_safe(error: &AuthError) {
+    fn assert_safe(case: &str, error: &AuthError) {
         for rendered in [error.to_string(), format!("{error:?}")] {
             for forbidden in [
                 ACCOUNT.to_owned(),
@@ -271,13 +271,13 @@ mod tests {
             ] {
                 assert!(
                     !rendered.contains(&forbidden),
-                    "classified error exposes sentinel: {rendered}"
+                    "case {case}: classified error exposes sentinel: {rendered}"
                 );
             }
         }
     }
 
-    fn assert_platform(error: &Error, cause: &str) {
+    fn assert_platform(case: &str, error: &Error, cause: &str) {
         let _restore = RestoreStore::new();
         for (operation, label) in [
             (KeyringOperation::Construct, "construct"),
@@ -291,121 +291,100 @@ mod tests {
                 continue;
             }
             let classified = classify_keyring_operation_error(error, operation, SECRET);
-            assert_safe(&classified);
-            assert_eq!(classified.code(), "auth.keyring_platform_error");
+            assert_safe(case, &classified);
+            assert_eq!(
+                classified.code(),
+                "auth.keyring_platform_error",
+                "case {case}: operation {label}"
+            );
             assert_eq!(
                 classified.to_string(),
-                format!("keyring operation failed: {label} no default store: {cause}")
+                format!("keyring operation failed: {label} no default store: {cause}"),
+                "case {case}: operation {label}"
             );
         }
     }
 
+    /// Each keyring error variant classifies as a platform error with safe
+    /// operation detail, preserves only numeric OS codes where present, and
+    /// suppresses hostile inner error and credential sentinels.
     #[test]
     #[serial]
-    fn platform_failure_has_safe_operation_detail() {
-        assert_platform(
-            &Error::PlatformFailure(hostile_inner()),
-            "credential store operation failed",
-        );
-    }
+    fn keyring_errors_have_safe_operation_details() {
+        type ErrorBuilder = fn() -> Error;
+        let cases: [(&str, ErrorBuilder, &str); 13] = [
+            (
+                "platform_failure",
+                || Error::PlatformFailure(hostile_inner()),
+                "credential store operation failed",
+            ),
+            (
+                "no_storage_access",
+                || Error::NoStorageAccess(hostile_inner()),
+                "credential store access denied",
+            ),
+            ("no_entry", || Error::NoEntry, "no matching credential"),
+            (
+                "no_default_store",
+                || Error::NoDefaultStore,
+                "no default credential store is configured",
+            ),
+            (
+                "bad_encoding",
+                || Error::BadEncoding([hostile_text().as_bytes(), RAW].concat()),
+                "stored password is not valid UTF-8",
+            ),
+            (
+                "bad_data_format",
+                || Error::BadDataFormat([hostile_text().as_bytes(), RAW].concat(), hostile_inner()),
+                "stored value could not be decoded",
+            ),
+            (
+                "bad_store_format",
+                || Error::BadStoreFormat(hostile_text()),
+                "credential store is not readable",
+            ),
+            (
+                "too_long",
+                || Error::TooLong(hostile_text(), 123),
+                "credential attribute exceeds the store limit",
+            ),
+            (
+                "invalid",
+                || Error::Invalid(hostile_text(), hostile_text()),
+                "invalid credential parameter",
+            ),
+            (
+                "ambiguous",
+                || {
+                    Error::Ambiguous(vec![
+                        Entry::new_with_credential(Arc::new(HostileCredential)),
+                        Entry::new_with_credential(Arc::new(HostileCredential)),
+                    ])
+                },
+                "multiple matching credentials (2)",
+            ),
+            (
+                "not_supported",
+                || Error::NotSupportedByStore(hostile_text()),
+                "operation is not supported by the credential store",
+            ),
+            (
+                "platform_failure_os_code",
+                || Error::PlatformFailure(Box::new(std::io::Error::from_raw_os_error(123))),
+                "credential store operation failed (OS error 123)",
+            ),
+            (
+                "access_failure_os_code",
+                || Error::NoStorageAccess(Box::new(std::io::Error::from_raw_os_error(123))),
+                "credential store access denied (OS error 123)",
+            ),
+        ];
 
-    #[test]
-    #[serial]
-    fn no_storage_access_has_safe_operation_detail() {
-        assert_platform(
-            &Error::NoStorageAccess(hostile_inner()),
-            "credential store access denied",
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn no_entry_has_safe_operation_detail() {
-        assert_platform(&Error::NoEntry, "no matching credential");
-    }
-
-    #[test]
-    #[serial]
-    fn no_default_store_has_safe_operation_detail() {
-        assert_platform(
-            &Error::NoDefaultStore,
-            "no default credential store is configured",
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn bad_encoding_has_safe_operation_detail() {
-        assert_platform(
-            &Error::BadEncoding([hostile_text().as_bytes(), RAW].concat()),
-            "stored password is not valid UTF-8",
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn bad_data_format_has_safe_operation_detail() {
-        assert_platform(
-            &Error::BadDataFormat([hostile_text().as_bytes(), RAW].concat(), hostile_inner()),
-            "stored value could not be decoded",
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn bad_store_format_has_safe_operation_detail() {
-        assert_platform(
-            &Error::BadStoreFormat(hostile_text()),
-            "credential store is not readable",
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn too_long_has_safe_operation_detail() {
-        assert_platform(
-            &Error::TooLong(hostile_text(), 123),
-            "credential attribute exceeds the store limit",
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn invalid_has_safe_operation_detail() {
-        assert_platform(
-            &Error::Invalid(hostile_text(), hostile_text()),
-            "invalid credential parameter",
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn ambiguous_has_safe_operation_detail() {
-        assert_platform(
-            &Error::Ambiguous(vec![
-                Entry::new_with_credential(Arc::new(HostileCredential)),
-                Entry::new_with_credential(Arc::new(HostileCredential)),
-            ]),
-            "multiple matching credentials (2)",
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn not_supported_has_safe_operation_detail() {
-        assert_platform(
-            &Error::NotSupportedByStore(hostile_text()),
-            "operation is not supported by the credential store",
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn platform_failure_preserves_only_os_code() {
-        assert_platform(
-            &Error::PlatformFailure(Box::new(std::io::Error::from_raw_os_error(123))),
-            "credential store operation failed (OS error 123)",
-        );
+        for (case, build_error, cause) in cases {
+            let error = build_error();
+            assert_platform(case, &error, cause);
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -416,6 +395,7 @@ mod tests {
         let display = status.to_string();
         let error = Error::PlatformFailure(Box::new(status));
         assert_platform(
+            "macos_platform_failure",
             &error,
             "credential store operation failed (OS status -25293)",
         );
@@ -423,15 +403,6 @@ mod tests {
         let text = classified.to_string();
         assert!(text.contains("(OS status -25293)"), "{text}");
         assert!(!text.contains(&display), "{text}");
-    }
-
-    #[test]
-    #[serial]
-    fn access_failure_preserves_only_os_code() {
-        assert_platform(
-            &Error::NoStorageAccess(Box::new(std::io::Error::from_raw_os_error(123))),
-            "credential store access denied (OS error 123)",
-        );
     }
 
     #[test]
@@ -546,7 +517,7 @@ mod tests {
                 error.to_string(),
                 "keyring operation failed: construct unknown credential store: no matching credential"
             );
-            assert_safe(&error);
+            assert_safe("unknown_store_metadata", &error);
         }
     }
 

@@ -5330,33 +5330,72 @@ mod tests {
 
     // ── parse_audit_timestamp_ms boundary tests ───────────────────────────────
 
+    /// `parse_audit_timestamp_ms` rejects wrong lengths, misplaced separators,
+    /// non-decimal digits, and out-of-range calendar or clock fields with the
+    /// expected diagnostic substrings.
     #[test]
-    fn parse_timestamp_rejects_wrong_length() {
-        // Too short — 23 chars instead of 24.
-        let err = parse_audit_timestamp_ms("2026-05-06T12:00:00.00Z");
-        assert!(err.is_err(), "expected error for too-short timestamp");
-        assert!(
-            err.unwrap_err().contains("YYYY-MM-DDTHH"),
-            "error should mention format"
-        );
-    }
+    fn parse_timestamp_rejects_malformed_and_out_of_range_inputs() {
+        const CASES: &[(&str, &str, Option<&str>)] = &[
+            (
+                "wrong_length",
+                "2026-05-06T12:00:00.00Z",
+                Some("YYYY-MM-DDTHH"),
+            ),
+            (
+                "wrong_separator_positions",
+                "2026-05-06 12:00:00.000Z",
+                None,
+            ),
+            (
+                "year_1969",
+                "1969-01-01T00:00:00.000Z",
+                Some("out of supported range"),
+            ),
+            (
+                "month_zero",
+                "2026-00-01T00:00:00.000Z",
+                Some("out of supported range"),
+            ),
+            ("month_13", "2026-13-01T00:00:00.000Z", None),
+            (
+                "day_zero",
+                "2026-01-00T00:00:00.000Z",
+                Some("day out of range"),
+            ),
+            (
+                "day_beyond_month_max",
+                "2026-04-31T00:00:00.000Z",
+                Some("day out of range"),
+            ),
+            (
+                "feb_29_non_leap_year",
+                "2026-02-29T00:00:00.000Z",
+                Some("day out of range"),
+            ),
+            (
+                "hour_24",
+                "2026-05-06T24:00:00.000Z",
+                Some("out of supported range"),
+            ),
+            ("minute_60", "2026-05-06T00:60:00.000Z", None),
+            ("second_60", "2026-05-06T00:00:60.000Z", None),
+            (
+                "non_decimal_digits",
+                "202X-05-06T00:00:00.000Z",
+                Some("non-decimal"),
+            ),
+        ];
 
-    #[test]
-    fn parse_timestamp_rejects_wrong_separator_positions() {
-        // 'T' in wrong position (position 10 replaced with space).
-        let err = parse_audit_timestamp_ms("2026-05-06 12:00:00.000Z");
-        assert!(err.is_err());
-    }
-
-    #[test]
-    fn parse_timestamp_rejects_year_1969() {
-        // Year before 1970 is out of supported range.
-        let err = parse_audit_timestamp_ms("1969-01-01T00:00:00.000Z");
-        assert!(err.is_err(), "expected error for year 1969");
-        assert!(
-            err.unwrap_err().contains("out of supported range"),
-            "error should mention out of range"
-        );
+        for &(case, input, expected_substring) in CASES {
+            let err_msg = format!("case {case}: expected error for {input:?}");
+            let err = parse_audit_timestamp_ms(input).expect_err(&err_msg);
+            if let Some(needle) = expected_substring {
+                assert!(
+                    err.contains(needle),
+                    "case {case}: expected error containing {needle:?}, got {err:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -5364,54 +5403,6 @@ mod tests {
         // Year 2100 is beyond the supported ceiling.
         let err = parse_audit_timestamp_ms("2100-01-01T00:00:00.000Z");
         assert!(err.is_err(), "expected error for year 2100");
-    }
-
-    #[test]
-    fn parse_timestamp_rejects_month_zero() {
-        let err = parse_audit_timestamp_ms("2026-00-01T00:00:00.000Z");
-        assert!(err.is_err(), "expected error for month 0");
-        assert!(
-            err.unwrap_err().contains("out of supported range"),
-            "error must cite out-of-range"
-        );
-    }
-
-    #[test]
-    fn parse_timestamp_rejects_month_13() {
-        let err = parse_audit_timestamp_ms("2026-13-01T00:00:00.000Z");
-        assert!(err.is_err(), "expected error for month 13");
-    }
-
-    #[test]
-    fn parse_timestamp_rejects_day_zero() {
-        let err = parse_audit_timestamp_ms("2026-01-00T00:00:00.000Z");
-        assert!(err.is_err(), "expected error for day 0");
-        assert!(
-            err.unwrap_err().contains("day out of range"),
-            "error must cite day out of range"
-        );
-    }
-
-    #[test]
-    fn parse_timestamp_rejects_day_beyond_month_max() {
-        // April has 30 days; day 31 is invalid.
-        let err = parse_audit_timestamp_ms("2026-04-31T00:00:00.000Z");
-        assert!(err.is_err(), "expected error for April 31");
-        assert!(
-            err.unwrap_err().contains("day out of range"),
-            "error must cite day out of range for month"
-        );
-    }
-
-    #[test]
-    fn parse_timestamp_rejects_feb_29_in_non_leap_year() {
-        // 2026 is not a leap year; Feb 29 is invalid.
-        let err = parse_audit_timestamp_ms("2026-02-29T00:00:00.000Z");
-        assert!(err.is_err(), "expected error for Feb 29 in 2026");
-        assert!(
-            err.unwrap_err().contains("day out of range"),
-            "error must cite day out of range for month"
-        );
     }
 
     #[test]
@@ -5445,39 +5436,6 @@ mod tests {
         // 2000 is divisible by 400 → leap year.
         let result = parse_audit_timestamp_ms("2000-02-29T00:00:00.000Z");
         assert!(result.is_ok(), "Feb 29 2000 must be accepted: {result:?}");
-    }
-
-    #[test]
-    fn parse_timestamp_rejects_hour_24() {
-        let err = parse_audit_timestamp_ms("2026-05-06T24:00:00.000Z");
-        assert!(err.is_err(), "expected error for hour 24");
-        assert!(
-            err.unwrap_err().contains("out of supported range"),
-            "error must cite out of range"
-        );
-    }
-
-    #[test]
-    fn parse_timestamp_rejects_minute_60() {
-        let err = parse_audit_timestamp_ms("2026-05-06T00:60:00.000Z");
-        assert!(err.is_err(), "expected error for minute 60");
-    }
-
-    #[test]
-    fn parse_timestamp_rejects_second_60() {
-        let err = parse_audit_timestamp_ms("2026-05-06T00:00:60.000Z");
-        assert!(err.is_err(), "expected error for second 60");
-    }
-
-    #[test]
-    fn parse_timestamp_rejects_non_decimal_digits() {
-        // Non-decimal character in the year field.
-        let err = parse_audit_timestamp_ms("202X-05-06T00:00:00.000Z");
-        assert!(err.is_err(), "expected error for non-decimal year");
-        assert!(
-            err.unwrap_err().contains("non-decimal"),
-            "error must mention non-decimal"
-        );
     }
 
     #[test]
