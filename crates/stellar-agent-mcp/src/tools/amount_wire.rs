@@ -155,247 +155,327 @@ mod tests {
     )]
     use super::*;
 
-    #[test]
-    fn parses_ordinary_decimal() {
-        assert_eq!(
-            parse_i128_field("qty_in", "250000000").unwrap(),
-            250_000_000
-        );
+    enum ErrCheck {
+        Any,
+        Exact {
+            message: &'static str,
+            forbidden: &'static str,
+        },
     }
 
+    /// `parse_i128_field` parses valid decimal strings exactly and rejects
+    /// malformed or out-of-range inputs without echoing raw values.
     #[test]
-    fn parses_negative_decimal_leaving_domain_check_to_caller() {
-        // The wire parser itself does not reject sign; a positivity guard
-        // downstream (e.g. dex_trade.rs's qty_in check) is what refuses it.
-        assert_eq!(parse_i128_field("qty_in", "-5").unwrap(), -5);
+    fn parse_i128_field_parses_valid_and_rejects_invalid_decimals() {
+        let cases = [
+            (
+                "ordinary_decimal",
+                "qty_in",
+                "250000000".to_owned(),
+                Ok(250_000_000_i128),
+            ),
+            ("negative_decimal", "qty_in", "-5".to_owned(), Ok(-5)),
+            ("explicit_plus_sign", "qty_in", "+5".to_owned(), Ok(5)),
+            (
+                "above_f64_precision_limit",
+                "qty_in",
+                "9007199254740993".to_owned(),
+                Ok(9_007_199_254_740_993_i128),
+            ),
+            ("i128_min", "qty_in", i128::MIN.to_string(), Ok(i128::MIN)),
+            ("i128_max", "qty_in", i128::MAX.to_string(), Ok(i128::MAX)),
+            ("leading_zeros", "qty_in", "007".to_owned(), Ok(7)),
+            (
+                "surrounding_whitespace_both",
+                "qty_in",
+                " 5 ".to_owned(),
+                Err(ErrCheck::Any),
+            ),
+            (
+                "surrounding_whitespace_trailing",
+                "qty_in",
+                "5 ".to_owned(),
+                Err(ErrCheck::Any),
+            ),
+            (
+                "surrounding_whitespace_leading",
+                "qty_in",
+                " 5".to_owned(),
+                Err(ErrCheck::Any),
+            ),
+            (
+                "decimal_point",
+                "qty_in",
+                "1.5".to_owned(),
+                Err(ErrCheck::Any),
+            ),
+            (
+                "exponent_notation",
+                "qty_in",
+                "1e9".to_owned(),
+                Err(ErrCheck::Any),
+            ),
+            ("empty_string", "qty_in", String::new(), Err(ErrCheck::Any)),
+            (
+                "malformed_sign",
+                "qty_in",
+                "+-3".to_owned(),
+                Err(ErrCheck::Any),
+            ),
+            (
+                "overflow_beyond_i128_max",
+                "qty_in",
+                format!("{}0", i128::MAX),
+                Err(ErrCheck::Any),
+            ),
+            (
+                "underflow_beyond_i128_min",
+                "qty_in",
+                format!("{}0", i128::MIN),
+                Err(ErrCheck::Any),
+            ),
+            (
+                "error_names_field_not_raw_value",
+                "qty_out_min",
+                "1.5".to_owned(),
+                Err(ErrCheck::Exact {
+                    message: "qty_out_min: not a valid decimal i128",
+                    forbidden: "1.5",
+                }),
+            ),
+        ];
+
+        for (name, field, input, expected) in cases {
+            let res = parse_i128_field(field, &input);
+            match expected {
+                Ok(want) => {
+                    assert!(res.is_ok(), "case {name}: expected Ok({want}), got {res:?}");
+                    if let Ok(got) = res {
+                        assert_eq!(got, want, "case {name}");
+                    }
+                }
+                Err(check) => {
+                    assert!(res.is_err(), "case {name}: expected Err, got {res:?}");
+                    if let (
+                        Err(err),
+                        ErrCheck::Exact {
+                            message: want_msg,
+                            forbidden,
+                        },
+                    ) = (res, check)
+                    {
+                        let msg = err.message.to_string();
+                        assert_eq!(msg, want_msg, "case {name}");
+                        assert!(
+                            !msg.contains(forbidden),
+                            "case {name}: error must not echo the raw value: {msg}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
+    /// `parse_i128_vec_field` parses every element in order, accepts empty
+    /// slices, and names the failing element index on invalid entries.
     #[test]
-    fn parses_explicit_plus_sign_to_the_correct_value() {
-        // `str::parse::<i128>` accepts a leading `+`; the parsed value is
-        // identical to the unsigned form. JSON numbers cannot carry a `+`,
-        // so this only widens what a well-formed decimal STRING may look
-        // like — it never changes a value.
-        assert_eq!(parse_i128_field("qty_in", "+5").unwrap(), 5);
-    }
+    fn parse_i128_vec_field_parses_elements_and_names_failing_index() {
+        struct VecCase {
+            name: &'static str,
+            raw: &'static [&'static str],
+            expected: Result<Vec<i128>, &'static str>,
+        }
 
-    #[test]
-    fn parses_value_above_f64_precision_limit_exactly() {
-        // 2^53 + 1: the first integer an f64-backed JSON number cannot
-        // represent exactly. The decimal-string parser must round-trip it
-        // byte-for-byte.
-        let s = "9007199254740993";
-        assert_eq!(
-            parse_i128_field("qty_in", s).unwrap(),
-            9_007_199_254_740_993_i128
-        );
-    }
+        let cases = [
+            VecCase {
+                name: "all_valid",
+                raw: &["1", "2", "3"],
+                expected: Ok(vec![1, 2, 3]),
+            },
+            VecCase {
+                name: "invalid_element_names_index",
+                raw: &["1", "not-a-number", "3"],
+                expected: Err("amounts_desired[1]"),
+            },
+            VecCase {
+                name: "empty_slice",
+                raw: &[],
+                expected: Ok(Vec::new()),
+            },
+        ];
 
-    #[test]
-    fn parses_i128_min_exactly() {
-        let s = i128::MIN.to_string();
-        assert_eq!(parse_i128_field("qty_in", &s).unwrap(), i128::MIN);
-    }
-
-    #[test]
-    fn parses_i128_max_exactly() {
-        let s = i128::MAX.to_string();
-        assert_eq!(parse_i128_field("qty_in", &s).unwrap(), i128::MAX);
-    }
-
-    #[test]
-    fn parses_leading_zeros_to_the_correct_value() {
-        assert_eq!(parse_i128_field("qty_in", "007").unwrap(), 7);
-    }
-
-    #[test]
-    fn rejects_surrounding_whitespace() {
-        assert!(parse_i128_field("qty_in", " 5 ").is_err());
-        assert!(parse_i128_field("qty_in", "5 ").is_err());
-        assert!(parse_i128_field("qty_in", " 5").is_err());
-    }
-
-    #[test]
-    fn rejects_decimal_point() {
-        assert!(parse_i128_field("qty_in", "1.5").is_err());
-    }
-
-    #[test]
-    fn rejects_exponent_notation() {
-        assert!(parse_i128_field("qty_in", "1e9").is_err());
-    }
-
-    #[test]
-    fn rejects_empty_string() {
-        assert!(parse_i128_field("qty_in", "").is_err());
-    }
-
-    #[test]
-    fn rejects_malformed_sign() {
-        assert!(parse_i128_field("qty_in", "+-3").is_err());
-    }
-
-    #[test]
-    fn rejects_overflow_beyond_i128_max() {
-        let overflow = format!("{}0", i128::MAX); // one digit past MAX
-        assert!(parse_i128_field("qty_in", &overflow).is_err());
-    }
-
-    #[test]
-    fn rejects_underflow_beyond_i128_min() {
-        let underflow = format!("{}0", i128::MIN); // one digit past MIN
-        assert!(parse_i128_field("qty_in", &underflow).is_err());
-    }
-
-    #[test]
-    fn error_message_names_the_field_and_not_the_raw_value() {
-        let err = parse_i128_field("qty_out_min", "1.5").unwrap_err();
-        let msg = err.message.to_string();
-        assert_eq!(msg, "qty_out_min: not a valid decimal i128");
-        assert!(
-            !msg.contains("1.5"),
-            "error must not echo the raw value: {msg}"
-        );
-    }
-
-    #[test]
-    fn vec_field_parses_every_element() {
-        let v = vec!["1".to_owned(), "2".to_owned(), "3".to_owned()];
-        assert_eq!(
-            parse_i128_vec_field("amounts_desired", &v).unwrap(),
-            vec![1, 2, 3]
-        );
-    }
-
-    #[test]
-    fn vec_field_names_the_failing_index() {
-        let v = vec!["1".to_owned(), "not-a-number".to_owned(), "3".to_owned()];
-        let err = parse_i128_vec_field("amounts_desired", &v).unwrap_err();
-        let msg = err.message.to_string();
-        assert!(
-            msg.contains("amounts_desired[1]"),
-            "error must name the failing index: {msg}"
-        );
-    }
-
-    #[test]
-    fn empty_vec_field_parses_to_empty_vec() {
-        assert_eq!(
-            parse_i128_vec_field("amounts_desired", &[]).unwrap(),
-            Vec::<i128>::new()
-        );
+        for case in cases {
+            let name = case.name;
+            let values: Vec<String> = case.raw.iter().map(|s| (*s).to_owned()).collect();
+            let res = parse_i128_vec_field("amounts_desired", &values);
+            match case.expected {
+                Ok(want) => {
+                    assert!(
+                        res.is_ok(),
+                        "case {name}: expected Ok({want:?}), got {res:?}"
+                    );
+                    if let Ok(got) = res {
+                        assert_eq!(got, want, "case {name}");
+                    }
+                }
+                Err(want_substr) => {
+                    assert!(res.is_err(), "case {name}: expected Err, got {res:?}");
+                    if let Err(err) = res {
+                        let msg = err.message.to_string();
+                        assert!(
+                            msg.contains(want_substr),
+                            "case {name}: error must name the failing index: {msg}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     // ── parse_stroops_i64_field / parse_stroops_u64_field ──────────────────
 
+    /// `parse_stroops_i64_field` parses signed `i64` decimals across the full
+    /// range and rejects invalid inputs without echoing raw values.
     #[test]
-    fn stroops_i64_parses_ordinary_decimal() {
-        assert_eq!(
-            parse_stroops_i64_field("amount_stroops", "250000000").unwrap(),
-            250_000_000
-        );
+    fn parse_stroops_i64_field_parses_valid_and_rejects_invalid_decimals() {
+        let cases = [
+            (
+                "ordinary_decimal",
+                "amount_stroops",
+                "250000000".to_owned(),
+                Ok(250_000_000_i64),
+            ),
+            ("negative_decimal", "limit_stroops", "-5".to_owned(), Ok(-5)),
+            (
+                "i64_max",
+                "limit_stroops",
+                i64::MAX.to_string(),
+                Ok(i64::MAX),
+            ),
+            (
+                "i64_min",
+                "limit_stroops",
+                i64::MIN.to_string(),
+                Ok(i64::MIN),
+            ),
+            (
+                "overflow_beyond_i64_max",
+                "limit_stroops",
+                format!("{}0", i64::MAX),
+                Err(ErrCheck::Any),
+            ),
+            (
+                "decimal_point",
+                "amount_stroops",
+                "1.5".to_owned(),
+                Err(ErrCheck::Any),
+            ),
+            (
+                "empty_string",
+                "amount_stroops",
+                String::new(),
+                Err(ErrCheck::Any),
+            ),
+            (
+                "error_names_field_not_raw_value",
+                "limit_stroops",
+                "1.5".to_owned(),
+                Err(ErrCheck::Exact {
+                    message: "limit_stroops: not a valid decimal i64 (stroops)",
+                    forbidden: "1.5",
+                }),
+            ),
+        ];
+
+        for (name, field, input, expected) in cases {
+            let res = parse_stroops_i64_field(field, &input);
+            match expected {
+                Ok(want) => {
+                    assert!(res.is_ok(), "case {name}: expected Ok({want}), got {res:?}");
+                    if let Ok(got) = res {
+                        assert_eq!(got, want, "case {name}");
+                    }
+                }
+                Err(check) => {
+                    assert!(res.is_err(), "case {name}: expected Err, got {res:?}");
+                    if let (
+                        Err(err),
+                        ErrCheck::Exact {
+                            message: want_msg,
+                            forbidden,
+                        },
+                    ) = (res, check)
+                    {
+                        let msg = err.message.to_string();
+                        assert_eq!(msg, want_msg, "case {name}");
+                        assert!(
+                            !msg.contains(forbidden),
+                            "case {name}: error must not echo the raw value: {msg}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
+    /// `parse_stroops_i64_opt_field` maps `None` to `Ok(None)`, parses valid
+    /// `Some` values, and rejects malformed `Some` values.
     #[test]
-    fn stroops_i64_parses_negative_leaving_domain_check_to_caller() {
-        assert_eq!(parse_stroops_i64_field("limit_stroops", "-5").unwrap(), -5);
+    fn parse_stroops_i64_opt_field_handles_none_valid_and_invalid() {
+        let cases = [
+            ("none", None, Ok(None)),
+            ("some_valid", Some("42"), Ok(Some(42_i64))),
+            ("some_invalid", Some("nope"), Err(())),
+        ];
+
+        for (name, input, expected) in cases {
+            let res = parse_stroops_i64_opt_field("limit_stroops", input);
+            match expected {
+                Ok(want) => {
+                    assert!(
+                        res.is_ok(),
+                        "case {name}: expected Ok({want:?}), got {res:?}"
+                    );
+                    if let Ok(got) = res {
+                        assert_eq!(got, want, "case {name}");
+                    }
+                }
+                Err(()) => {
+                    assert!(res.is_err(), "case {name}: expected Err, got {res:?}");
+                }
+            }
+        }
     }
 
+    /// `parse_stroops_u64_field` parses unsigned `u64` decimals up to `u64::MAX`
+    /// and rejects negative, fractional, and empty inputs.
     #[test]
-    fn stroops_i64_parses_i64_max_exactly() {
-        let s = i64::MAX.to_string();
-        assert_eq!(
-            parse_stroops_i64_field("limit_stroops", &s).unwrap(),
-            i64::MAX
-        );
-    }
+    fn parse_stroops_u64_field_parses_valid_and_rejects_invalid_decimals() {
+        let cases = [
+            (
+                "ordinary_decimal",
+                "250000000".to_owned(),
+                Ok(250_000_000_u64),
+            ),
+            ("negative", "-5".to_owned(), Err(())),
+            ("u64_max", u64::MAX.to_string(), Ok(u64::MAX)),
+            ("decimal_point", "1.5".to_owned(), Err(())),
+            ("empty_string", String::new(), Err(())),
+        ];
 
-    #[test]
-    fn stroops_i64_parses_i64_min_exactly() {
-        let s = i64::MIN.to_string();
-        assert_eq!(
-            parse_stroops_i64_field("limit_stroops", &s).unwrap(),
-            i64::MIN
-        );
-    }
-
-    #[test]
-    fn stroops_i64_rejects_overflow_beyond_i64_max() {
-        let overflow = format!("{}0", i64::MAX);
-        assert!(parse_stroops_i64_field("limit_stroops", &overflow).is_err());
-    }
-
-    #[test]
-    fn stroops_i64_rejects_decimal_point() {
-        assert!(parse_stroops_i64_field("amount_stroops", "1.5").is_err());
-    }
-
-    #[test]
-    fn stroops_i64_rejects_empty_string() {
-        assert!(parse_stroops_i64_field("amount_stroops", "").is_err());
-    }
-
-    #[test]
-    fn stroops_i64_error_names_field_and_not_the_raw_value() {
-        let err = parse_stroops_i64_field("limit_stroops", "1.5").unwrap_err();
-        let msg = err.message.to_string();
-        assert_eq!(msg, "limit_stroops: not a valid decimal i64 (stroops)");
-        assert!(
-            !msg.contains("1.5"),
-            "error must not echo the raw value: {msg}"
-        );
-    }
-
-    #[test]
-    fn stroops_i64_opt_none_maps_to_ok_none() {
-        assert_eq!(
-            parse_stroops_i64_opt_field("limit_stroops", None).unwrap(),
-            None
-        );
-    }
-
-    #[test]
-    fn stroops_i64_opt_some_parses() {
-        assert_eq!(
-            parse_stroops_i64_opt_field("limit_stroops", Some("42")).unwrap(),
-            Some(42)
-        );
-    }
-
-    #[test]
-    fn stroops_i64_opt_some_invalid_errors() {
-        assert!(parse_stroops_i64_opt_field("limit_stroops", Some("nope")).is_err());
-    }
-
-    #[test]
-    fn stroops_u64_parses_ordinary_decimal() {
-        assert_eq!(
-            parse_stroops_u64_field("amount_in_stroops", "250000000").unwrap(),
-            250_000_000
-        );
-    }
-
-    #[test]
-    fn stroops_u64_rejects_negative() {
-        assert!(parse_stroops_u64_field("amount_in_stroops", "-5").is_err());
-    }
-
-    #[test]
-    fn stroops_u64_parses_u64_max_exactly() {
-        let s = u64::MAX.to_string();
-        assert_eq!(
-            parse_stroops_u64_field("amount_in_stroops", &s).unwrap(),
-            u64::MAX
-        );
-    }
-
-    #[test]
-    fn stroops_u64_rejects_decimal_point() {
-        assert!(parse_stroops_u64_field("amount_in_stroops", "1.5").is_err());
-    }
-
-    #[test]
-    fn stroops_u64_rejects_empty_string() {
-        assert!(parse_stroops_u64_field("amount_in_stroops", "").is_err());
+        for (name, input, expected) in cases {
+            let res = parse_stroops_u64_field("amount_in_stroops", &input);
+            match expected {
+                Ok(want) => {
+                    assert!(res.is_ok(), "case {name}: expected Ok({want}), got {res:?}");
+                    if let Ok(got) = res {
+                        assert_eq!(got, want, "case {name}");
+                    }
+                }
+                Err(()) => {
+                    assert!(res.is_err(), "case {name}: expected Err, got {res:?}");
+                }
+            }
+        }
     }
 }

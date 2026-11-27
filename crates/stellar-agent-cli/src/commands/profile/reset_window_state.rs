@@ -596,18 +596,52 @@ mod tests {
         args: ResetWindowStateArgs,
     }
 
+    /// Accepts a positional profile name or `--profile`, and rejects both or neither.
     #[test]
-    fn positional_name_is_accepted() {
-        let w = Wrap::try_parse_from(["prog", "acme", "--reason", "recovery"])
-            .expect("positional parses");
-        assert_eq!(w.args.profile_name(), "acme");
-    }
+    fn profile_selector_accepts_positional_or_flag_and_rejects_conflict_or_missing() {
+        let cases: [(&str, &[&str], Result<&str, ErrorKind>); 4] = [
+            (
+                "positional_name",
+                &["prog", "acme", "--reason", "recovery"],
+                Ok("acme"),
+            ),
+            (
+                "profile_flag",
+                &["prog", "--profile", "acme", "--reason", "recovery"],
+                Ok("acme"),
+            ),
+            (
+                "both_positional_and_flag",
+                &["prog", "acme", "--profile", "other", "--reason", "recovery"],
+                Err(ErrorKind::ArgumentConflict),
+            ),
+            (
+                "neither_positional_nor_flag",
+                &["prog", "--reason", "recovery"],
+                Err(ErrorKind::MissingRequiredArgument),
+            ),
+        ];
 
-    #[test]
-    fn profile_flag_is_accepted() {
-        let w = Wrap::try_parse_from(["prog", "--profile", "acme", "--reason", "recovery"])
-            .expect("flag parses");
-        assert_eq!(w.args.profile_name(), "acme");
+        for (name, argv, expected) in cases {
+            let parsed = Wrap::try_parse_from(argv);
+            match expected {
+                Ok(want) => {
+                    assert!(parsed.is_ok(), "case {name}: parse failed: {parsed:?}");
+                    if let Ok(w) = parsed {
+                        assert_eq!(w.args.profile_name(), want, "case {name}");
+                    }
+                }
+                Err(want_kind) => {
+                    assert!(
+                        parsed.is_err(),
+                        "case {name}: expected {want_kind:?}: {parsed:?}"
+                    );
+                    if let Err(err) = parsed {
+                        assert_eq!(err.kind(), want_kind, "case {name}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -624,20 +658,6 @@ mod tests {
         assert_eq!(parsed.args.owner_secret_env.as_deref(), Some("OWNER_SEED"));
         let absent = Wrap::try_parse_from(["prog", "acme", "--reason", "repair"]).unwrap();
         assert!(absent.args.owner_secret_env.is_none());
-    }
-
-    #[test]
-    fn both_positional_and_flag_is_a_conflict() {
-        let err =
-            Wrap::try_parse_from(["prog", "acme", "--profile", "other", "--reason", "recovery"])
-                .unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
-    }
-
-    #[test]
-    fn neither_positional_nor_flag_is_missing_required() {
-        let err = Wrap::try_parse_from(["prog", "--reason", "recovery"]).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
     }
 
     #[tokio::test(flavor = "current_thread")]
