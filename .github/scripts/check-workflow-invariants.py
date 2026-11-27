@@ -92,7 +92,8 @@ The check fails when any of these holds:
   ``COVERAGE_GATE_CONDITION``, after the check strips the surrounding
   whitespace and one enclosing ``${{ }}``. The gate runs on always() only. Its first step must be ``decision`` and pass
   ``MEASURE`` the label and push docs-only clauses of the measuring jobs,
-  with the same expression unwrapping. Every gate checkout, download and floor
+  as the exact ``COVERAGE_MEASURE`` text, including ``${{ }}``.
+  Every gate checkout, download and floor
   step must use the measured output guard, optionally enclosed in ``${{ }}``.
 - ``coverage-names``: a job name is not its required plain constant.
 - ``selftest-selection``: a self-test has an unknown group, the wrong condition,
@@ -1422,7 +1423,7 @@ class Checker:
         steps = gate.get("steps", []) or []
         first = steps[0] if steps else {}
         if (first.get("id") != "decision"
-                or self.unwrap_expression(str((first.get("env") or {}).get("MEASURE", ""))) != self.unwrap_expression(COVERAGE_MEASURE)):
+                or (first.get("env") or {}).get("MEASURE", "") != COVERAGE_MEASURE):
             self.report(workflow, "coverage-condition", "coverage gate decision must use the measure expression")
         for step in steps:
             if self.coverage_measured_step(step) and self.unwrap_expression(str(step.get("if", ""))) != COVERAGE_MEASURED:

@@ -29,6 +29,7 @@ thread_local! {
     static WRITE_FAULT: std::cell::Cell<(u8, u8)> = const { std::cell::Cell::new((0, 0)) };
     static ADVANCE: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
     static ALLOWANCE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static DEADLINE_EXTENSION: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
 }
 
 pub(super) async fn after_attempt() {
@@ -49,6 +50,9 @@ pub(super) fn before_fresh() {
 pub(super) fn configure_budget(budget: &mut Budget) {
     if let Some(allowance) = ALLOWANCE.take() {
         budget.attempt_limit = budget.used.attempt.checked_add(allowance).unwrap();
+    }
+    if let Some(extension) = DEADLINE_EXTENSION.get() {
+        budget.deadline = budget.deadline.checked_add(extension).unwrap();
     }
 }
 
@@ -1619,12 +1623,22 @@ struct ProxyCredential {
     user: String,
 }
 
-fn proxy(address: &str, request: &Value) -> Value {
+/// The read bound for a bridge request the parent answers at once.
+const BRIDGE_REPLY: Duration = Duration::from_secs(15);
+
+/// The bound for a wait on the other child process: its process start under
+/// an instrumented build can take longer than [`BRIDGE_REPLY`].
+const PEER_WAIT: Duration = Duration::from_secs(120);
+
+/// The extension of a race child's pass deadline: one [`PEER_WAIT`] for the
+/// `ready` barrier, which the pass deadline already runs through, and one for
+/// the parent's `getTransaction` responder.
+const RACE_DEADLINE_EXTENSION: Duration = Duration::from_secs(240);
+
+fn proxy(address: &str, request: &Value, read_timeout: Duration) -> Value {
     use std::io::{BufRead, BufReader, Write};
     let mut stream = std::net::TcpStream::connect(address).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(15)))
-        .unwrap();
+    stream.set_read_timeout(Some(read_timeout)).unwrap();
     writeln!(stream, "{request}").unwrap();
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line).unwrap();
@@ -1662,7 +1676,8 @@ impl keyring_core::api::CredentialApi for ProxyCredential {
         assert_eq!(
             proxy(
                 &self.address,
-                &json!({"op":"set","service":self.service,"user":self.user,"secret":secret})
+                &json!({"op":"set","service":self.service,"user":self.user,"secret":secret}),
+                BRIDGE_REPLY,
             ),
             true
         );
@@ -1672,6 +1687,7 @@ impl keyring_core::api::CredentialApi for ProxyCredential {
         let result = proxy(
             &self.address,
             &json!({"op":"get","service":self.service,"user":self.user}),
+            BRIDGE_REPLY,
         );
         if result.is_null() {
             Err(keyring_core::Error::NoEntry)
@@ -1683,6 +1699,7 @@ impl keyring_core::api::CredentialApi for ProxyCredential {
         let result = proxy(
             &self.address,
             &json!({"op":"delete","service":self.service,"user":self.user}),
+            BRIDGE_REPLY,
         );
         if result == true {
             Ok(())
@@ -1712,6 +1729,7 @@ async fn driver_process_child() {
         return;
     };
     let config: Value = serde_json::from_str(&config).unwrap();
+    DEADLINE_EXTENSION.set(Some(RACE_DEADLINE_EXTENSION));
     let address = config["bridge"].as_str().unwrap().to_owned();
     keyring_core::set_default_store(Arc::new(ProxyStore(address.clone())));
     let _clock = crate::mainnet::clock::set_now_ms_for_test(NOW);
@@ -1725,7 +1743,8 @@ async fn driver_process_child() {
     WRITE_HOOK.with_borrow_mut(|hook| {
         *hook = Some(Box::new(move |stage| {
             if stage == 1 {
-                assert_eq!(proxy(&bridge, &json!({"op":"ready"})), true);
+                // The parent answers only when both children are ready.
+                assert_eq!(proxy(&bridge, &json!({"op":"ready"}), PEER_WAIT), true);
             }
         }))
     });
@@ -1750,7 +1769,11 @@ async fn driver_process_child() {
         );
     }
     assert_eq!(
-        proxy(&address, &json!({"op":"done","success":success})),
+        proxy(
+            &address,
+            &json!({"op":"done","success":success}),
+            BRIDGE_REPLY
+        ),
         true
     );
 }
@@ -1835,7 +1858,7 @@ async fn driver_two_processes_race_reservation() {
         .respond_with(move |request: &wiremock::Request| {
             let (lock, condition) = &*signal;
             let (seen, timeout) = condition
-                .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(10), |seen| !*seen)
+                .wait_timeout_while(lock.lock().unwrap(), PEER_WAIT, |seen| !*seen)
                 .unwrap();
             if !*seen || timeout.timed_out() {
                 return wiremock::ResponseTemplate::new(503);
@@ -1933,7 +1956,10 @@ async fn driver_two_processes_race_reservation() {
     })
     .await
     .unwrap();
-    assert_eq!(proxy(&address, &json!({"op":"shutdown"})), true);
+    assert_eq!(
+        proxy(&address, &json!({"op":"shutdown"}), BRIDGE_REPLY),
+        true
+    );
     for output in output {
         assert!(
             output.status.success(),

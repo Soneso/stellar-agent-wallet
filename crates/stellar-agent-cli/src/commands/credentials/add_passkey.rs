@@ -912,6 +912,7 @@ mod tests {
         );
 
         let (bridge, mgr, _store) = start_test_registration(&dir, "failed").await;
+        let listener_tasks = bridge.listener_tasks();
         let handle = mgr
             .prepare_registration("laptop", bridge.local_addr(), None)
             .await
@@ -934,6 +935,7 @@ mod tests {
         assert!(matches!(end, RegistrationEnd::Interrupted), "{end:?}");
         assert!(probe.waited());
         probe.assert_failed_open_left_nothing(&handle.nonce);
+        crate::common::test_support::assert_listeners_stopped(&listener_tasks, 2);
     }
 
     /// What the operator does at the confirmation prompt.

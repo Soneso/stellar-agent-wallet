@@ -1433,8 +1433,8 @@ mod tests {
     const BUSY: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
     const ALREADY_FUNDED: &[u8] = b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/problem+json\r\nContent-Length: 126\r\n\r\n\
         {\"type\":\"https://stellar.org/horizon-errors/bad_request\",\"title\":\"Bad Request\",\"status\":400,\"detail\":\"Account Already Funded\"}";
-    const ACCOUNT_EXISTS: &[u8] = b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/problem+json\r\nContent-Length: 177\r\n\r\n\
-        {\"type\":\"https://stellar.org/horizon-errors/bad_request\",\"title\":\"Bad Request\",\"status\":400,\"detail\":\"createAccountAlreadyExist (AAAAAAAAAGT/////AAAAAQAAAAAAAAAA/////AAAAAA==)\"}";
+    const ACCOUNT_EXISTS: &[u8] = b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/problem+json\r\nContent-Length: 176\r\n\r\n\
+        {\"type\":\"https://stellar.org/horizon-errors/bad_request\",\"title\":\"Bad Request\",\"status\":400,\"detail\":\"createAccountAlreadyExist (AAAAAAAAAGT/////AAAAAQAAAAAAAAAA/////AAAAAA=)\"}";
     const ACCOUNT_EXISTS_UPPER: &[u8] = b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/problem+json\r\nContent-Length: 129\r\n\r\n\
         {\"type\":\"https://stellar.org/horizon-errors/bad_request\",\"title\":\"Bad Request\",\"status\":400,\"detail\":\"CREATEACCOUNTALREADYEXIST\"}";
 

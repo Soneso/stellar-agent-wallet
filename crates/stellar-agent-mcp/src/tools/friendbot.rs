@@ -258,7 +258,7 @@ mod tests {
                 "type": "https://stellar.org/horizon-errors/bad_request",
                 "title": "Bad Request",
                 "status": 400,
-                "detail": "createAccountAlreadyExist (AAAAAAAAAGT/////AAAAAQAAAAAAAAAA/////AAAAAA==)",
+                "detail": "createAccountAlreadyExist (AAAAAAAAAGT/////AAAAAQAAAAAAAAAA/////AAAAAA=)",
             })))
             .expect(1)
             .mount(&mock)

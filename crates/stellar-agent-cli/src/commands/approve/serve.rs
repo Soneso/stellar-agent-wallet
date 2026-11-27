@@ -777,6 +777,7 @@ mod tests {
         crate::common::test_support::assert_listeners_stopped(&listener_tasks, 1);
 
         let (handle, url, token) = start_test_inbox(&dir).await;
+        let listener_tasks = handle.listener_tasks();
         let probe = HandoffProbe::default();
         tokio::time::timeout(
             bound,
@@ -792,8 +793,10 @@ mod tests {
         .expect("the shutdown signal ends the serve phase");
         assert!(probe.waited());
         probe.assert_failed_open_left_nothing(&token);
+        crate::common::test_support::assert_listeners_stopped(&listener_tasks, 1);
 
         let (handle, url, _token) = start_test_inbox(&dir).await;
+        let listener_tasks = handle.listener_tasks();
         let probe = HandoffProbe::default();
         tokio::time::timeout(
             bound,
@@ -803,6 +806,7 @@ mod tests {
         .expect("the shutdown signal ends the serve phase");
         assert!(probe.waited());
         assert!(probe.launched().is_empty());
+        crate::common::test_support::assert_listeners_stopped(&listener_tasks, 1);
     }
 
     async fn operator_inbox() {
