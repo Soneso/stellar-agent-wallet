@@ -587,141 +587,187 @@ fn signed_toolset_payment_rule_loads_with_payment_minimums() {
         ]
     );
 }
-minimum!(
-    minimum_body_version,
-    "body_version",
-    |d: &mut DocumentMut| {
-        d["version"] = value(1);
+/// Each violation of the mainnet minimum on a valid baseline policy reports
+/// the expected `PolicyError::MainnetMinimumUnmet` requirement.
+#[test]
+#[serial_test::serial]
+fn mainnet_minimum_rejects_unmet_policy_requirements() {
+    fn rule_for<'a>(doc: &'a mut DocumentMut, case: &str) -> &'a mut toml_edit::Table {
+        let rules_msg = format!("case {case}: rules array of tables");
+        let first_msg = format!("case {case}: first rule");
+        doc["rules"]
+            .as_array_of_tables_mut()
+            .expect(&rules_msg)
+            .get_mut(0)
+            .expect(&first_msg)
     }
-);
-minimum!(minimum_sequence, "body_version", |d: &mut DocumentMut| {
-    d["sequence"] = value(0);
-});
-minimum!(
-    minimum_mainnet_table,
-    "mainnet_table",
-    |d: &mut DocumentMut| {
-        d.remove("mainnet");
+
+    fn criterion_for<'a>(
+        doc: &'a mut DocumentMut,
+        index: usize,
+        case: &str,
+    ) -> &'a mut toml_edit::InlineTable {
+        let criteria_msg = format!("case {case}: criteria array");
+        let item_msg = format!("case {case}: criterion {index}");
+        let table_msg = format!("case {case}: criterion {index} inline table");
+        rule_for(doc, case)["criteria"]
+            .as_array_mut()
+            .expect(&criteria_msg)
+            .get_mut(index)
+            .expect(&item_msg)
+            .as_inline_table_mut()
+            .expect(&table_msg)
     }
-);
-minimum!(minimum_rules_empty, "rules_empty", |d: &mut DocumentMut| {
-    d.remove("rules");
-});
-minimum!(minimum_scope, "scope", |d: &mut DocumentMut| {
-    d["scope"] = value("profile:*");
-});
-minimum!(minimum_chain, "chain", |d: &mut DocumentMut| {
-    rule(d)["match"]["chain"] = value("*");
-});
-minimum!(minimum_tool, "tool", |d: &mut DocumentMut| {
-    rule(d)["match"]["tool"] = value("*");
-});
-minimum!(minimum_opaque, "opaque", |d: &mut DocumentMut| {
-    rule(d)["allow_opaque_signing"] = value(true);
-});
+
+    type PolicyEdit = fn(&mut DocumentMut, &str);
+    let cases: &[(&str, &str, PolicyEdit)] = &[
+        ("body_version", "body_version", |d, _| {
+            d["version"] = value(1);
+        }),
+        ("sequence", "body_version", |d, _| {
+            d["sequence"] = value(0);
+        }),
+        ("mainnet_table", "mainnet_table", |d, _| {
+            d.remove("mainnet");
+        }),
+        ("rules_empty", "rules_empty", |d, _| {
+            d.remove("rules");
+        }),
+        ("scope", "scope", |d, _| {
+            d["scope"] = value("profile:*");
+        }),
+        ("chain", "chain", |d, case| {
+            rule_for(d, case)["match"]["chain"] = value("*");
+        }),
+        ("tool", "tool", |d, case| {
+            rule_for(d, case)["match"]["tool"] = value("*");
+        }),
+        ("opaque", "opaque", |d, case| {
+            rule_for(d, case)["allow_opaque_signing"] = value(true);
+        }),
+        ("asset_allowlist", "asset_allowlist", |d, case| {
+            let msg = format!("case {case}: criteria array");
+            rule_for(d, case)["criteria"]
+                .as_array_mut()
+                .expect(&msg)
+                .remove(0);
+        }),
+        ("destination", "destination", |d, case| {
+            let msg = format!("case {case}: criteria array");
+            rule_for(d, case)["criteria"]
+                .as_array_mut()
+                .expect(&msg)
+                .remove(1);
+        }),
+        ("known_issuer_only", "destination", |d, case| {
+            criterion_for(d, 1, case).insert(
+                "kinds",
+                toml_edit::Value::Array(["KNOWN_ISSUER"].into_iter().collect()),
+            );
+        }),
+        ("per_tx_cap", "per_tx_cap", |d, case| {
+            let msg = format!("case {case}: criteria array");
+            rule_for(d, case)["criteria"]
+                .as_array_mut()
+                .expect(&msg)
+                .remove(2);
+        }),
+        ("per_period_cap", "per_period_cap", |d, case| {
+            let msg = format!("case {case}: criteria array");
+            rule_for(d, case)["criteria"]
+                .as_array_mut()
+                .expect(&msg)
+                .remove(3);
+        }),
+        ("rate_limit", "rate_limit", |d, case| {
+            let msg = format!("case {case}: criteria array");
+            rule_for(d, case)["criteria"]
+                .as_array_mut()
+                .expect(&msg)
+                .remove(4);
+        }),
+        ("fee_cap", "fee_cap", |d, case| {
+            let msg = format!("case {case}: mainnet table");
+            d["mainnet"]
+                .as_table_like_mut()
+                .expect(&msg)
+                .remove("classic_max_fee_per_op_stroops");
+        }),
+        ("native_floor", "thresholds", |d, _| {
+            d["mainnet"]["cross_check_thresholds"]["native"] = value("9999999999");
+        }),
+        ("positive_threshold", "thresholds", |d, _| {
+            d["mainnet"]["cross_check_thresholds"]["native"] = value("0");
+        }),
+        ("authorization_ttl", "ttl", |d, _| {
+            d["mainnet"]["authorization_ttl_seconds"] = value(121);
+        }),
+        ("claim_has_no_assets", "asset_allowlist", |d, case| {
+            rule_for(d, case)["match"]["tool"] = value("stellar_claim");
+        }),
+        ("duplicate_asset_allowlist", "asset_allowlist", |d, case| {
+            let arr_msg = format!("case {case}: criteria array");
+            let first_msg = format!("case {case}: first criterion");
+            let extra = rule_for(d, case)["criteria"]
+                .as_array()
+                .expect(&arr_msg)
+                .get(0)
+                .expect(&first_msg)
+                .clone();
+            rule_for(d, case)["criteria"]
+                .as_array_mut()
+                .expect(&arr_msg)
+                .push(extra);
+        }),
+        ("unpinned_asset", "asset_allowlist", |d, case| {
+            criterion_for(d, 0, case).insert(
+                "assets",
+                toml_edit::Value::Array(["USD"].into_iter().collect()),
+            );
+        }),
+        ("authorization_ttl_zero", "ttl", |d, _| {
+            d["mainnet"]["authorization_ttl_seconds"] = value(0);
+        }),
+        ("threshold_key", "thresholds", |d, _| {
+            d["mainnet"]["cross_check_thresholds"]["USD"] = value("1");
+        }),
+    ];
+
+    for &(case, requirement, edit) in cases {
+        let sandbox_msg = format!("case {case}: create state sandbox");
+        let storage_sandbox =
+            stellar_agent_test_support::sandbox::StateSandbox::new().expect(&sandbox_msg);
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let profile = profile(true);
+        let parse_msg = format!("case {case}: parse FULL policy fixture");
+        let mut doc = FULL.parse::<DocumentMut>().expect(&parse_msg);
+        let baseline = mainnet_minimum::failures(&doc, &profile, "operator");
+        assert!(
+            baseline.is_empty(),
+            "case {case}: baseline policy must meet mainnet minimum: {baseline:?}"
+        );
+        edit(&mut doc, case);
+        let failures = mainnet_minimum::failures(&doc, &profile, "operator");
+        assert!(
+            failures.iter().any(|error| matches!(
+                error,
+                PolicyError::MainnetMinimumUnmet {
+                    requirement: found,
+                    ..
+                } if *found == requirement
+            )),
+            "case {case}: expected requirement {requirement}, got {failures:?}"
+        );
+    }
+}
+
 minimum!(minimum_ttl_absent, "rule_ttl", |d: &mut DocumentMut| {
     rule(d).remove("ttl_secs");
 });
 minimum!(minimum_ttl_above_day, "rule_ttl", |d: &mut DocumentMut| {
     rule(d)["ttl_secs"] = value(86_401);
 });
-minimum!(
-    minimum_asset_allowlist,
-    "asset_allowlist",
-    |d: &mut DocumentMut| {
-        rule(d)["criteria"].as_array_mut().unwrap().remove(0);
-    }
-);
-minimum!(minimum_destination, "destination", |d: &mut DocumentMut| {
-    rule(d)["criteria"].as_array_mut().unwrap().remove(1);
-});
-minimum!(
-    minimum_known_issuer_only,
-    "destination",
-    |d: &mut DocumentMut| {
-        criterion(d, 1).insert(
-            "kinds",
-            toml_edit::Value::Array(["KNOWN_ISSUER"].into_iter().collect()),
-        );
-    }
-);
-minimum!(minimum_per_tx_cap, "per_tx_cap", |d: &mut DocumentMut| {
-    rule(d)["criteria"].as_array_mut().unwrap().remove(2);
-});
-minimum!(
-    minimum_per_period_cap,
-    "per_period_cap",
-    |d: &mut DocumentMut| {
-        rule(d)["criteria"].as_array_mut().unwrap().remove(3);
-    }
-);
-minimum!(minimum_rate_limit, "rate_limit", |d: &mut DocumentMut| {
-    rule(d)["criteria"].as_array_mut().unwrap().remove(4);
-});
-minimum!(minimum_fee_cap, "fee_cap", |d: &mut DocumentMut| {
-    d["mainnet"]
-        .as_table_like_mut()
-        .unwrap()
-        .remove("classic_max_fee_per_op_stroops");
-});
-minimum!(minimum_native_floor, "thresholds", |d: &mut DocumentMut| {
-    d["mainnet"]["cross_check_thresholds"]["native"] = value("9999999999");
-});
-minimum!(
-    minimum_positive_threshold,
-    "thresholds",
-    |d: &mut DocumentMut| {
-        d["mainnet"]["cross_check_thresholds"]["native"] = value("0");
-    }
-);
-minimum!(minimum_authorization_ttl, "ttl", |d: &mut DocumentMut| {
-    d["mainnet"]["authorization_ttl_seconds"] = value(121);
-});
-minimum!(
-    minimum_claim_has_no_assets,
-    "asset_allowlist",
-    |d: &mut DocumentMut| {
-        rule(d)["match"]["tool"] = value("stellar_claim");
-    }
-);
-
-minimum!(
-    minimum_duplicate_asset_allowlist,
-    "asset_allowlist",
-    |d: &mut DocumentMut| {
-        let extra = rule(d)["criteria"]
-            .as_array()
-            .unwrap()
-            .get(0)
-            .unwrap()
-            .clone();
-        rule(d)["criteria"].as_array_mut().unwrap().push(extra);
-    }
-);
-minimum!(
-    minimum_unpinned_asset,
-    "asset_allowlist",
-    |d: &mut DocumentMut| {
-        criterion(d, 0).insert(
-            "assets",
-            toml_edit::Value::Array(["USD"].into_iter().collect()),
-        );
-    }
-);
-minimum!(
-    minimum_authorization_ttl_zero,
-    "ttl",
-    |d: &mut DocumentMut| {
-        d["mainnet"]["authorization_ttl_seconds"] = value(0);
-    }
-);
-minimum!(
-    minimum_threshold_key,
-    "thresholds",
-    |d: &mut DocumentMut| {
-        d["mainnet"]["cross_check_thresholds"]["USD"] = value("1");
-    }
-);
 #[test]
 #[serial_test::serial]
 fn minimum_deny_rules_need_no_value_restrictions() {
