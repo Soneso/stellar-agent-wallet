@@ -3923,25 +3923,108 @@ mod tests {
         );
     }
 
+    /// `Profile::builder_testnet` sets the expected default network identity,
+    /// version, derived keyring coordinates, policy engine, wallet unlock TTL,
+    /// and absent optional fields.
     #[test]
     #[serial_test::serial]
-    fn testnet_builder_chain_id() {
-        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-        let _storage_home =
-            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-        let p = make_testnet_profile();
-        assert_eq!(p.chain_id, crate::profile::caip2::Caip2::Testnet);
-        assert!(!p.chain_id.is_mainnet());
-    }
+    fn testnet_builder_defaults() {
+        type DefaultCheck = fn(&Profile, &str);
+        let cases: &[(&str, DefaultCheck)] = &[
+            ("chain_id", |p, case| {
+                assert_eq!(
+                    p.chain_id,
+                    crate::profile::caip2::Caip2::Testnet,
+                    "case {case}"
+                );
+                assert!(!p.chain_id.is_mainnet(), "case {case}");
+            }),
+            ("passphrase_derived_from_chain_id", |p, case| {
+                assert_eq!(p.network_passphrase, TESTNET_PASSPHRASE, "case {case}");
+            }),
+            ("mcp_disabled_default_false", |p, case| {
+                assert!(!p.mcp_disabled, "case {case}");
+            }),
+            ("classic_fee_per_op_default_none", |p, case| {
+                assert_eq!(p.classic_fee_per_op_stroops, None, "case {case}");
+            }),
+            ("version_is_2", |p, case| {
+                assert_eq!(p.version, 2, "case {case}");
+            }),
+            ("audit_key_default_derived_name", |p, case| {
+                assert_eq!(
+                    p.audit_log_hash_chain_key_id.service, "stellar-agent-audit-test-profile",
+                    "case {case}"
+                );
+                assert_eq!(
+                    p.audit_log_hash_chain_key_id.account, "default",
+                    "case {case}"
+                );
+            }),
+            ("owner_key_default_derived_name", |p, case| {
+                assert_eq!(
+                    p.policy_owner_key_id.service, "stellar-agent-owner-test-profile",
+                    "case {case}"
+                );
+                assert_eq!(p.policy_owner_key_id.account, "default", "case {case}");
+            }),
+            ("attestation_key_default_derived_name", |p, case| {
+                assert_eq!(
+                    p.attestation_key_id.service, "stellar-agent-attestation-test-profile",
+                    "case {case}"
+                );
+                assert_eq!(p.attestation_key_id.account, "default", "case {case}");
+            }),
+            ("counterparty_key_default_derived_name", |p, case| {
+                assert_eq!(
+                    p.counterparty_cache_key_id.service, "stellar-agent-counterparty-test-profile",
+                    "case {case}"
+                );
+                assert_eq!(
+                    p.counterparty_cache_key_id.account, "default",
+                    "case {case}"
+                );
+            }),
+            ("oracle_provider_url_default_none", |p, case| {
+                assert_eq!(p.oracle_provider_url, None, "case {case}");
+            }),
+            ("policy_engine_default_v1_for_new_profiles", |p, case| {
+                assert_eq!(
+                    p.policy.engine,
+                    PolicyEngineKind::V1,
+                    "case {case}: new profiles must default to V1"
+                );
+            }),
+            ("wallet_config_default_unlock_ttl_is_30", |p, case| {
+                assert_eq!(p.wallet.unlock_ttl_seconds, 30, "case {case}");
+            }),
+            ("pool_fields_none_in_new_profile", |p, case| {
+                assert!(
+                    p.pool_master_key_id.is_none(),
+                    "case {case}: pool_master_key_id must be None in a newly built profile"
+                );
+                assert!(
+                    p.pool_config.is_none(),
+                    "case {case}: pool_config must be None in a newly built profile"
+                );
+            }),
+            ("smart_account_max_scan_id_defaults_to_none", |p, case| {
+                assert_eq!(
+                    p.smart_account_max_context_rule_scan_id, None,
+                    "case {case}"
+                );
+            }),
+        ];
 
-    #[test]
-    #[serial_test::serial]
-    fn testnet_builder_passphrase_derived_from_chain_id() {
-        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-        let _storage_home =
-            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-        let p = make_testnet_profile();
-        assert_eq!(p.network_passphrase, TESTNET_PASSPHRASE);
+        for &(case, check) in cases {
+            let sandbox_msg = format!("case {case}: create state sandbox");
+            let storage_sandbox =
+                stellar_agent_test_support::sandbox::StateSandbox::new().expect(&sandbox_msg);
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            let p = make_testnet_profile();
+            check(&p, case);
+        }
     }
 
     #[test]
@@ -4213,16 +4296,6 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn mcp_disabled_default_false() {
-        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-        let _storage_home =
-            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-        let p = make_testnet_profile();
-        assert!(!p.mcp_disabled);
-    }
-
-    #[test]
-    #[serial_test::serial]
     fn mcp_disabled_builder() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let _storage_home =
@@ -4231,16 +4304,6 @@ mod tests {
             .mcp_disabled()
             .build();
         assert!(p.mcp_disabled);
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn classic_fee_per_op_default_none() {
-        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-        let _storage_home =
-            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-        let p = make_testnet_profile();
-        assert_eq!(p.classic_fee_per_op_stroops, None);
     }
 
     #[test]
@@ -4333,30 +4396,6 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn version_is_2() {
-        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-        let _storage_home =
-            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-        let p = make_testnet_profile();
-        assert_eq!(p.version, 2);
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn audit_key_default_derived_name() {
-        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-        let _storage_home =
-            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-        let p = make_testnet_profile();
-        assert_eq!(
-            p.audit_log_hash_chain_key_id.service,
-            "stellar-agent-audit-test-profile"
-        );
-        assert_eq!(p.audit_log_hash_chain_key_id.account, "default");
-    }
-
-    #[test]
-    #[serial_test::serial]
     fn default_audit_log_path_for_appends_profile_log_under_audit() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let _storage_home =
@@ -4415,75 +4454,6 @@ mod tests {
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
         let path = default_audit_log_path_for("profile/fixture");
         assert_eq!(path, sandbox.path().join("audit/profile_fixture.jsonl"));
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn owner_key_default_derived_name() {
-        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-        let _storage_home =
-            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-        let p = make_testnet_profile();
-        assert_eq!(
-            p.policy_owner_key_id.service,
-            "stellar-agent-owner-test-profile"
-        );
-        assert_eq!(p.policy_owner_key_id.account, "default");
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn attestation_key_default_derived_name() {
-        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-        let _storage_home =
-            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-        let p = make_testnet_profile();
-        assert_eq!(
-            p.attestation_key_id.service,
-            "stellar-agent-attestation-test-profile"
-        );
-        assert_eq!(p.attestation_key_id.account, "default");
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn counterparty_key_default_derived_name() {
-        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-        let _storage_home =
-            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-        let p = make_testnet_profile();
-        assert_eq!(
-            p.counterparty_cache_key_id.service,
-            "stellar-agent-counterparty-test-profile"
-        );
-        assert_eq!(p.counterparty_cache_key_id.account, "default");
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn oracle_provider_url_default_none() {
-        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-        let _storage_home =
-            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-        let p = make_testnet_profile();
-        assert_eq!(p.oracle_provider_url, None);
-    }
-
-    /// New profiles minted via the builder default to `V1`.  Migrated profiles
-    /// retain `Noop` — see `migrate_v1_to_v2_produces_noop_engine` in
-    /// `migrate.rs`.
-    #[test]
-    #[serial_test::serial]
-    fn policy_engine_default_v1_for_new_profiles() {
-        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-        let _storage_home =
-            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-        let p = make_testnet_profile();
-        assert_eq!(
-            p.policy.engine,
-            PolicyEngineKind::V1,
-            "new profiles must default to V1"
-        );
     }
 
     /// Both testnet and mainnet builder-produced profiles default to `V1`.
@@ -5085,16 +5055,6 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn wallet_config_default_unlock_ttl_is_30() {
-        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-        let _storage_home =
-            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-        let p = make_testnet_profile();
-        assert_eq!(p.wallet.unlock_ttl_seconds, 30);
-    }
-
-    #[test]
-    #[serial_test::serial]
     fn builder_session_rule_max_horizon_ledgers_some_and_none() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let _storage_home =
@@ -5176,25 +5136,6 @@ mod tests {
         assert_eq!(
             restored.secondary_rpc_url.as_deref(),
             Some("https://secondary.example.com")
-        );
-    }
-
-    // ── Pool fields are None in freshly built profiles ────────────────────────
-
-    #[test]
-    #[serial_test::serial]
-    fn pool_fields_none_in_new_profile() {
-        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-        let _storage_home =
-            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-        let p = make_testnet_profile();
-        assert!(
-            p.pool_master_key_id.is_none(),
-            "pool_master_key_id must be None in a newly built profile"
-        );
-        assert!(
-            p.pool_config.is_none(),
-            "pool_config must be None in a newly built profile"
         );
     }
 
@@ -5604,16 +5545,6 @@ mod tests {
     }
 
     // ── smart_account_max_context_rule_scan_id ────────────────────────────────
-
-    #[test]
-    #[serial_test::serial]
-    fn smart_account_max_scan_id_defaults_to_none() {
-        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-        let _storage_home =
-            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-        let p = make_testnet_profile();
-        assert_eq!(p.smart_account_max_context_rule_scan_id, None);
-    }
 
     #[test]
     #[serial_test::serial]

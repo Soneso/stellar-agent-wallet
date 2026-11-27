@@ -833,46 +833,158 @@ mod tests {
         validate_context_rule_proposal_snapshot(&valid_snapshot()).unwrap();
     }
 
+    /// `validate_context_rule_proposal_snapshot` rejects malformed versions,
+    /// names, signers, policies, and authorization rule lists, preserving the
+    /// diagnostic text pinned for version, signer count, and muxed addresses.
     #[test]
-    fn rejects_wrong_snapshot_version() {
-        let mut s = valid_snapshot();
-        s.snapshot_version = 3_141_592_653;
-        let reason = format!("snapshot_version must be {CONTEXT_RULE_PROPOSAL_SNAPSHOT_VERSION}");
-        assert_eq!(
-            validate_context_rule_proposal_snapshot(&s).unwrap_err(),
-            reason
-        );
-    }
+    fn validate_snapshot_rejects_invalid_fields() {
+        use base64::Engine as _;
 
-    #[test]
-    fn rejects_empty_name() {
-        let mut s = valid_snapshot();
-        s.name = String::new();
-        assert!(validate_context_rule_proposal_snapshot(&s).is_err());
-    }
+        enum ExpectedError {
+            Any,
+            Contains(&'static str),
+            Exact(String),
+        }
 
-    #[test]
-    fn rejects_oversized_name() {
-        let mut s = valid_snapshot();
-        s.name = "a".repeat(RULE_PROPOSAL_MAX_NAME_BYTES + 1);
-        assert!(validate_context_rule_proposal_snapshot(&s).is_err());
-    }
+        type SnapshotMutator = fn(&mut ContextRuleProposalSnapshot);
+        let cases: [(&str, SnapshotMutator, ExpectedError); 14] = [
+            (
+                "wrong_snapshot_version",
+                |s| s.snapshot_version = 3_141_592_653,
+                ExpectedError::Exact(format!(
+                    "snapshot_version must be {CONTEXT_RULE_PROPOSAL_SNAPSHOT_VERSION}"
+                )),
+            ),
+            ("empty_name", |s| s.name = String::new(), ExpectedError::Any),
+            (
+                "oversized_name",
+                |s| s.name = "a".repeat(RULE_PROPOSAL_MAX_NAME_BYTES + 1),
+                ExpectedError::Any,
+            ),
+            (
+                "empty_signers",
+                |s| s.signers = vec![],
+                ExpectedError::Contains("signers"),
+            ),
+            (
+                "too_many_signers",
+                |s| {
+                    s.signers = (0..=RULE_PROPOSAL_MAX_SIGNERS)
+                        .map(|_| RuleProposalSigner::delegated(G_ADDR.to_owned(), false))
+                        .collect();
+                },
+                ExpectedError::Any,
+            ),
+            (
+                "delegated_signer_m_strkey_address",
+                |s| {
+                    let muxed = stellar_strkey::ed25519::MuxedAccount {
+                        ed25519: [0u8; 32],
+                        id: 7,
+                    };
+                    s.signers
+                        .push(RuleProposalSigner::delegated(format!("{muxed}"), false));
+                },
+                ExpectedError::Exact(
+                    "signers[1]: address must be a valid G-strkey or C-strkey \
+                     (56 chars, ^[GC][A-Z2-7]{55}$)"
+                        .to_owned(),
+                ),
+            ),
+            (
+                "delegated_signer_with_verifier_field",
+                |s| {
+                    s.signers = vec![RuleProposalSigner {
+                        kind: RuleProposalSignerKind::Delegated,
+                        address: Some(G_ADDR.to_owned()),
+                        verifier: Some(C_ADDR.to_owned()),
+                        pubkey_data: None,
+                        is_proposer: false,
+                    }];
+                },
+                ExpectedError::Any,
+            ),
+            (
+                "external_signer_oversized_pubkey",
+                |s| {
+                    s.signers = vec![RuleProposalSigner::external(
+                        C_ADDR.to_owned(),
+                        vec![0u8; RULE_PROPOSAL_MAX_EXTERNAL_KEY_BYTES + 1],
+                        false,
+                    )];
+                },
+                ExpectedError::Any,
+            ),
+            (
+                "external_signer_missing_verifier",
+                |s| {
+                    s.signers = vec![RuleProposalSigner {
+                        kind: RuleProposalSignerKind::External,
+                        address: None,
+                        verifier: None,
+                        pubkey_data: Some(vec![0u8; 65]),
+                        is_proposer: false,
+                    }];
+                },
+                ExpectedError::Any,
+            ),
+            (
+                "too_many_policies",
+                |s| {
+                    let params_b64 =
+                        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"params");
+                    s.policies = (0..=RULE_PROPOSAL_MAX_POLICIES)
+                        .map(|_| RuleProposalPolicy::new(C_ADDR.to_owned(), params_b64.clone()))
+                        .collect();
+                },
+                ExpectedError::Any,
+            ),
+            (
+                "policy_invalid_base64",
+                |s| {
+                    s.policies = vec![RuleProposalPolicy::new(
+                        C_ADDR.to_owned(),
+                        "not valid base64!!".to_owned(),
+                    )];
+                },
+                ExpectedError::Any,
+            ),
+            (
+                "policy_oversized_params",
+                |s| {
+                    let oversized = vec![0u8; RULE_PROPOSAL_MAX_POLICY_PARAMS_BYTES + 1];
+                    let params_b64 =
+                        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(oversized);
+                    s.policies = vec![RuleProposalPolicy::new(C_ADDR.to_owned(), params_b64)];
+                },
+                ExpectedError::Any,
+            ),
+            (
+                "empty_auth_rule_ids",
+                |s| s.auth_rule_ids = vec![],
+                ExpectedError::Any,
+            ),
+            (
+                "too_many_auth_rule_ids",
+                |s| s.auth_rule_ids = (0..=RULE_PROPOSAL_MAX_AUTH_RULE_IDS as u32).collect(),
+                ExpectedError::Any,
+            ),
+        ];
 
-    #[test]
-    fn rejects_empty_signers() {
-        let mut s = valid_snapshot();
-        s.signers = vec![];
-        let err = validate_context_rule_proposal_snapshot(&s).unwrap_err();
-        assert!(err.contains("signers"));
-    }
-
-    #[test]
-    fn rejects_too_many_signers() {
-        let mut s = valid_snapshot();
-        s.signers = (0..=RULE_PROPOSAL_MAX_SIGNERS)
-            .map(|_| RuleProposalSigner::delegated(G_ADDR.to_owned(), false))
-            .collect();
-        assert!(validate_context_rule_proposal_snapshot(&s).is_err());
+        for (case, mutate, expected) in cases {
+            let mut snapshot = valid_snapshot();
+            mutate(&mut snapshot);
+            let err_msg = format!("case {case}: expected validation error");
+            let err = validate_context_rule_proposal_snapshot(&snapshot).expect_err(&err_msg);
+            match expected {
+                ExpectedError::Any => {}
+                ExpectedError::Contains(needle) => assert!(
+                    err.contains(needle),
+                    "case {case}: expected error containing {needle:?}, got {err:?}"
+                ),
+                ExpectedError::Exact(want) => assert_eq!(err, want, "case {case}"),
+            }
+        }
     }
 
     /// A `Delegated` signer's address may be a C-strkey: a contract
@@ -885,38 +997,6 @@ mod tests {
         assert_eq!(validate_context_rule_proposal_snapshot(&s), Ok(()));
     }
 
-    /// A `Delegated` signer's address that is neither a G-strkey nor a
-    /// C-strkey, a muxed M-strkey here, is refused with the signer's index.
-    #[test]
-    fn rejects_delegated_signer_with_an_m_strkey_address() {
-        let mut s = valid_snapshot();
-        let muxed = stellar_strkey::ed25519::MuxedAccount {
-            ed25519: [0u8; 32],
-            id: 7,
-        };
-        s.signers
-            .push(RuleProposalSigner::delegated(format!("{muxed}"), false));
-        assert_eq!(
-            validate_context_rule_proposal_snapshot(&s),
-            Err("signers[1]: address must be a valid G-strkey or C-strkey \
-                 (56 chars, ^[GC][A-Z2-7]{55}$)"
-                .to_owned())
-        );
-    }
-
-    #[test]
-    fn rejects_delegated_signer_with_verifier_field() {
-        let mut s = valid_snapshot();
-        s.signers = vec![RuleProposalSigner {
-            kind: RuleProposalSignerKind::Delegated,
-            address: Some(G_ADDR.to_owned()),
-            verifier: Some(C_ADDR.to_owned()),
-            pubkey_data: None,
-            is_proposer: false,
-        }];
-        assert!(validate_context_rule_proposal_snapshot(&s).is_err());
-    }
-
     #[test]
     fn accepts_external_signer() {
         let mut s = valid_snapshot();
@@ -926,75 +1006,6 @@ mod tests {
             false,
         )];
         validate_context_rule_proposal_snapshot(&s).unwrap();
-    }
-
-    #[test]
-    fn rejects_external_signer_oversized_pubkey() {
-        let mut s = valid_snapshot();
-        s.signers = vec![RuleProposalSigner::external(
-            C_ADDR.to_owned(),
-            vec![0u8; RULE_PROPOSAL_MAX_EXTERNAL_KEY_BYTES + 1],
-            false,
-        )];
-        assert!(validate_context_rule_proposal_snapshot(&s).is_err());
-    }
-
-    #[test]
-    fn rejects_external_signer_missing_verifier() {
-        let mut s = valid_snapshot();
-        s.signers = vec![RuleProposalSigner {
-            kind: RuleProposalSignerKind::External,
-            address: None,
-            verifier: None,
-            pubkey_data: Some(vec![0u8; 65]),
-            is_proposer: false,
-        }];
-        assert!(validate_context_rule_proposal_snapshot(&s).is_err());
-    }
-
-    #[test]
-    fn rejects_too_many_policies() {
-        use base64::Engine as _;
-        let params_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"params");
-        let mut s = valid_snapshot();
-        s.policies = (0..=RULE_PROPOSAL_MAX_POLICIES)
-            .map(|_| RuleProposalPolicy::new(C_ADDR.to_owned(), params_b64.clone()))
-            .collect();
-        assert!(validate_context_rule_proposal_snapshot(&s).is_err());
-    }
-
-    #[test]
-    fn rejects_policy_invalid_base64() {
-        let mut s = valid_snapshot();
-        s.policies = vec![RuleProposalPolicy::new(
-            C_ADDR.to_owned(),
-            "not valid base64!!".to_owned(),
-        )];
-        assert!(validate_context_rule_proposal_snapshot(&s).is_err());
-    }
-
-    #[test]
-    fn rejects_policy_oversized_params() {
-        use base64::Engine as _;
-        let oversized = vec![0u8; RULE_PROPOSAL_MAX_POLICY_PARAMS_BYTES + 1];
-        let params_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(oversized);
-        let mut s = valid_snapshot();
-        s.policies = vec![RuleProposalPolicy::new(C_ADDR.to_owned(), params_b64)];
-        assert!(validate_context_rule_proposal_snapshot(&s).is_err());
-    }
-
-    #[test]
-    fn rejects_empty_auth_rule_ids() {
-        let mut s = valid_snapshot();
-        s.auth_rule_ids = vec![];
-        assert!(validate_context_rule_proposal_snapshot(&s).is_err());
-    }
-
-    #[test]
-    fn rejects_too_many_auth_rule_ids() {
-        let mut s = valid_snapshot();
-        s.auth_rule_ids = (0..=RULE_PROPOSAL_MAX_AUTH_RULE_IDS as u32).collect();
-        assert!(validate_context_rule_proposal_snapshot(&s).is_err());
     }
 
     #[test]

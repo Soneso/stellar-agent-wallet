@@ -2198,84 +2198,123 @@ mod tests {
         assert_eq!(a.as_str(), "0.000000000000000001");
     }
 
-    /// Rejection: empty string.
+    /// `AnchorAmount::parse` rejects empty, signed, scientific, malformed,
+    /// non-digit, zero, over-length, and over-precision inputs with the exact
+    /// typed error variant and limit payloads.
     #[test]
-    fn anchor_amount_empty_rejected() {
-        let err = AnchorAmount::parse("").expect_err("empty must be rejected");
-        assert!(
-            matches!(err, AnchorAmountError::Empty),
-            "expected Empty, got {err:?}"
+    fn anchor_amount_rejects_invalid_inputs() {
+        let over_len: String = "1".to_owned() + &"0".repeat(40);
+        assert_eq!(
+            over_len.len(),
+            41,
+            "case over_length: fixture must be 41 chars"
         );
-    }
+        let over_prec = "0.0000000000000000001";
+        assert_eq!(
+            over_prec.split('.').nth(1).map_or(0, str::len),
+            19,
+            "case over_precision: fixture must have 19 decimal places"
+        );
 
-    /// Rejection: negative sign.
-    #[test]
-    fn anchor_amount_negative_rejected() {
-        let err = AnchorAmount::parse("-5").expect_err("-5 must be rejected");
-        assert!(
-            matches!(err, AnchorAmountError::LeadingSign),
-            "expected LeadingSign, got {err:?}"
-        );
-    }
+        type ErrorCheck = fn(&AnchorAmountError, &str);
+        let cases: [(&str, &str, ErrorCheck); 13] = [
+            ("empty", "", |err, case| {
+                assert!(
+                    matches!(err, AnchorAmountError::Empty),
+                    "case {case}: expected Empty, got {err:?}"
+                );
+            }),
+            ("negative", "-5", |err, case| {
+                assert!(
+                    matches!(err, AnchorAmountError::LeadingSign),
+                    "case {case}: expected LeadingSign, got {err:?}"
+                );
+            }),
+            ("plus_sign", "+5", |err, case| {
+                assert!(
+                    matches!(err, AnchorAmountError::LeadingSign),
+                    "case {case}: expected LeadingSign, got {err:?}"
+                );
+            }),
+            ("scientific_notation_e", "1e3", |err, case| {
+                assert!(
+                    matches!(err, AnchorAmountError::ScientificNotation),
+                    "case {case}: expected ScientificNotation, got {err:?}"
+                );
+            }),
+            ("scientific_notation_cap_e", "1E3", |err, case| {
+                assert!(
+                    matches!(err, AnchorAmountError::ScientificNotation),
+                    "case {case}: expected ScientificNotation, got {err:?}"
+                );
+            }),
+            ("multiple_dots", "1.2.3", |err, case| {
+                assert!(
+                    matches!(err, AnchorAmountError::MultipleDots),
+                    "case {case}: expected MultipleDots, got {err:?}"
+                );
+            }),
+            ("leading_dot", ".5", |err, case| {
+                assert!(
+                    matches!(err, AnchorAmountError::LeadingDot),
+                    "case {case}: expected LeadingDot, got {err:?}"
+                );
+            }),
+            ("trailing_dot", "5.", |err, case| {
+                assert!(
+                    matches!(err, AnchorAmountError::TrailingDot),
+                    "case {case}: expected TrailingDot, got {err:?}"
+                );
+            }),
+            ("alpha", "abc", |err, case| {
+                assert!(
+                    matches!(err, AnchorAmountError::InvalidChar { .. }),
+                    "case {case}: expected InvalidChar, got {err:?}"
+                );
+            }),
+            ("zero_bare", "0", |err, case| {
+                assert!(
+                    matches!(err, AnchorAmountError::Zero),
+                    "case {case}: expected Zero, got {err:?}"
+                );
+            }),
+            ("zero_fractional", "0.0", |err, case| {
+                assert!(
+                    matches!(err, AnchorAmountError::Zero),
+                    "case {case}: expected Zero, got {err:?}"
+                );
+            }),
+            ("over_length", &over_len, |err, case| {
+                assert!(
+                    matches!(
+                        err,
+                        AnchorAmountError::TooLong {
+                            max: ANCHOR_AMOUNT_MAX_LEN,
+                            actual: 41
+                        }
+                    ),
+                    "case {case}: expected TooLong {{ max: {ANCHOR_AMOUNT_MAX_LEN}, actual: 41 }}, got {err:?}"
+                );
+            }),
+            ("over_precision", over_prec, |err, case| {
+                assert!(
+                    matches!(
+                        err,
+                        AnchorAmountError::TooManyDecimals {
+                            max: ANCHOR_AMOUNT_MAX_DECIMAL_PLACES,
+                            actual: 19
+                        }
+                    ),
+                    "case {case}: expected TooManyDecimals {{ max: {ANCHOR_AMOUNT_MAX_DECIMAL_PLACES}, actual: 19 }}, got {err:?}"
+                );
+            }),
+        ];
 
-    /// Rejection: positive sign.
-    #[test]
-    fn anchor_amount_plus_sign_rejected() {
-        let err = AnchorAmount::parse("+5").expect_err("+5 must be rejected");
-        assert!(
-            matches!(err, AnchorAmountError::LeadingSign),
-            "expected LeadingSign, got {err:?}"
-        );
-    }
-
-    /// Rejection: scientific notation with `e`.
-    #[test]
-    fn anchor_amount_scientific_notation_e_rejected() {
-        let err = AnchorAmount::parse("1e3").expect_err("1e3 must be rejected");
-        assert!(
-            matches!(err, AnchorAmountError::ScientificNotation),
-            "expected ScientificNotation, got {err:?}"
-        );
-    }
-
-    /// Rejection: scientific notation with `E`.
-    #[test]
-    fn anchor_amount_scientific_notation_cap_e_rejected() {
-        let err = AnchorAmount::parse("1E3").expect_err("1E3 must be rejected");
-        assert!(
-            matches!(err, AnchorAmountError::ScientificNotation),
-            "expected ScientificNotation, got {err:?}"
-        );
-    }
-
-    /// Rejection: multiple decimal points.
-    #[test]
-    fn anchor_amount_multiple_dots_rejected() {
-        let err = AnchorAmount::parse("1.2.3").expect_err("1.2.3 must be rejected");
-        assert!(
-            matches!(err, AnchorAmountError::MultipleDots),
-            "expected MultipleDots, got {err:?}"
-        );
-    }
-
-    /// Rejection: leading dot with no integer part.
-    #[test]
-    fn anchor_amount_leading_dot_rejected() {
-        let err = AnchorAmount::parse(".5").expect_err(".5 must be rejected");
-        assert!(
-            matches!(err, AnchorAmountError::LeadingDot),
-            "expected LeadingDot, got {err:?}"
-        );
-    }
-
-    /// Rejection: trailing dot with no fractional part.
-    #[test]
-    fn anchor_amount_trailing_dot_rejected() {
-        let err = AnchorAmount::parse("5.").expect_err("5. must be rejected");
-        assert!(
-            matches!(err, AnchorAmountError::TrailingDot),
-            "expected TrailingDot, got {err:?}"
-        );
+        for (case, input, check) in cases {
+            let err_msg = format!("case {case}: {input:?} must be rejected");
+            let err = AnchorAmount::parse(input).expect_err(&err_msg);
+            check(&err, case);
+        }
     }
 
     /// Rejection: Unicode (non-ASCII) digits MUST be rejected as `InvalidChar`.
@@ -2311,78 +2350,6 @@ mod tests {
                 "expected InvalidChar for {s:?}, got {err:?}"
             );
         }
-    }
-
-    /// Rejection: non-digit, non-dot character.
-    #[test]
-    fn anchor_amount_alpha_rejected() {
-        let err = AnchorAmount::parse("abc").expect_err("abc must be rejected");
-        assert!(
-            matches!(err, AnchorAmountError::InvalidChar { .. }),
-            "expected InvalidChar, got {err:?}"
-        );
-    }
-
-    /// Rejection: zero value as bare `"0"`.
-    #[test]
-    fn anchor_amount_zero_bare_rejected() {
-        let err = AnchorAmount::parse("0").expect_err("0 must be rejected");
-        assert!(
-            matches!(err, AnchorAmountError::Zero),
-            "expected Zero, got {err:?}"
-        );
-    }
-
-    /// Rejection: all-zero fractional `"0.0"`.
-    #[test]
-    fn anchor_amount_zero_fractional_rejected() {
-        let err = AnchorAmount::parse("0.0").expect_err("0.0 must be rejected");
-        assert!(
-            matches!(err, AnchorAmountError::Zero),
-            "expected Zero, got {err:?}"
-        );
-    }
-
-    /// Rejection: over-length string (exceeds `ANCHOR_AMOUNT_MAX_LEN`).
-    #[test]
-    fn anchor_amount_over_length_rejected() {
-        // 41 characters: "1" followed by 40 zeros.
-        let over_len: String = "1".to_owned() + &"0".repeat(40);
-        assert_eq!(over_len.len(), 41, "fixture must be 41 chars");
-        let err = AnchorAmount::parse(&over_len).expect_err("41-char string must be rejected");
-        assert!(
-            matches!(
-                err,
-                AnchorAmountError::TooLong {
-                    max: ANCHOR_AMOUNT_MAX_LEN,
-                    actual: 41
-                }
-            ),
-            "expected TooLong {{ max: {ANCHOR_AMOUNT_MAX_LEN}, actual: 41 }}, got {err:?}"
-        );
-    }
-
-    /// Rejection: over-precision string (exceeds `ANCHOR_AMOUNT_MAX_DECIMAL_PLACES`).
-    #[test]
-    fn anchor_amount_over_precision_rejected() {
-        // 19 decimal places — one past the limit.
-        let over_prec = "0.0000000000000000001";
-        assert_eq!(
-            over_prec.split('.').nth(1).map_or(0, str::len),
-            19,
-            "fixture must have 19 decimal places"
-        );
-        let err = AnchorAmount::parse(over_prec).expect_err("19 dp must be rejected");
-        assert!(
-            matches!(
-                err,
-                AnchorAmountError::TooManyDecimals {
-                    max: ANCHOR_AMOUNT_MAX_DECIMAL_PLACES,
-                    actual: 19
-                }
-            ),
-            "expected TooManyDecimals {{ max: {ANCHOR_AMOUNT_MAX_DECIMAL_PLACES}, actual: 19 }}, got {err:?}"
-        );
     }
 
     /// Serde: deserialise a valid JSON string to `AnchorAmount`.

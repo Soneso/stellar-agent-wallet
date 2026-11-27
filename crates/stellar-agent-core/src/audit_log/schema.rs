@@ -5639,18 +5639,42 @@ mod tests {
         );
     }
 
-    /// `SaVerifierHashDrift` with missing fields MUST fail to deserialise.
-    ///
-    /// No `#[serde(default)]` on fields — serde defaults open silent data-integrity holes.
+    /// Tag-only `EventKind` JSON payloads with missing required fields fail
+    /// deserialization so absent fields cannot silently default.
     #[test]
-    fn event_kind_sa_verifier_hash_drift_missing_fields_fail() {
-        // Omit all payload fields — must fail because fields have no defaults.
-        let json = r#"{"kind":"sa_verifier_hash_drift"}"#;
-        let result: Result<EventKind, _> = serde_json::from_str(json);
-        assert!(
-            result.is_err(),
-            "missing-field deserialisation must fail for SaVerifierHashDrift"
-        );
+    fn event_kind_tag_only_payloads_fail_deserialization() {
+        const CASES: &[&str] = &[
+            "sa_verifier_hash_drift",
+            "sa_policy_hash_drift",
+            "sa_mutable_contract_override",
+            "sa_unknown_contract_override",
+            "sa_verifier_migrated",
+            "sa_verifier_diversification_override",
+            "sa_verifier_allowlist_advisory",
+            "sa_policy_added",
+            "sa_policy_removed",
+            "sa_spending_limit_retuned",
+            "sa_weighted_threshold_changed",
+            "sa_external_execute_submitted",
+            "sa_signer_weight_changed",
+            "approval_attested",
+            "approval_rejected",
+            "approval_attested_remote",
+            "approval_rejected_remote",
+            "x402_payment_authorized",
+            "opaque_payload_signed",
+            "keyring_key_written",
+            "policy_window_state_reset",
+        ];
+
+        for &kind in CASES {
+            let json = format!(r#"{{"kind":"{kind}"}}"#);
+            let result: Result<EventKind, _> = serde_json::from_str(&json);
+            assert!(
+                result.is_err(),
+                "case {kind}: tag-only payload must fail deserialization, got {result:?}"
+            );
+        }
     }
 
     /// Round-trip: both drift events carry `observed_executable` when set.
@@ -5740,17 +5764,6 @@ mod tests {
         );
     }
 
-    /// `SaPolicyHashDrift` with missing fields MUST fail to deserialise.
-    #[test]
-    fn event_kind_sa_policy_hash_drift_missing_fields_fail() {
-        let json = r#"{"kind":"sa_policy_hash_drift"}"#;
-        let result: Result<EventKind, _> = serde_json::from_str(json);
-        assert!(
-            result.is_err(),
-            "missing-field deserialisation must fail for SaPolicyHashDrift"
-        );
-    }
-
     /// Round-trip for `SaMutableContractOverride`.
     #[test]
     fn event_kind_sa_mutable_contract_override_round_trip() {
@@ -5788,17 +5801,6 @@ mod tests {
         assert!(
             !s.contains("request_id"),
             "request_id must NOT appear as a variant field: {s}"
-        );
-    }
-
-    /// `SaMutableContractOverride` with missing fields MUST fail to deserialise.
-    #[test]
-    fn event_kind_sa_mutable_contract_override_missing_fields_fail() {
-        let json = r#"{"kind":"sa_mutable_contract_override"}"#;
-        let result: Result<EventKind, _> = serde_json::from_str(json);
-        assert!(
-            result.is_err(),
-            "missing-field deserialisation must fail for SaMutableContractOverride"
         );
     }
 
@@ -5914,17 +5916,6 @@ mod tests {
         );
     }
 
-    /// `SaUnknownContractOverride` with missing fields MUST fail to deserialise.
-    #[test]
-    fn event_kind_sa_unknown_contract_override_missing_fields_fail() {
-        let json = r#"{"kind":"sa_unknown_contract_override"}"#;
-        let result: Result<EventKind, _> = serde_json::from_str(json);
-        assert!(
-            result.is_err(),
-            "missing-field deserialisation must fail for SaUnknownContractOverride"
-        );
-    }
-
     /// `VerifierAdvisoryKind` Display and serde closed-set test.
     ///
     /// Verifies the two-value closed set serialises as snake_case strings and
@@ -5999,17 +5990,6 @@ mod tests {
         );
     }
 
-    /// `SaVerifierMigrated` with missing fields MUST fail to deserialise.
-    #[test]
-    fn event_kind_sa_verifier_migrated_missing_fields_fail() {
-        let json = r#"{"kind":"sa_verifier_migrated"}"#;
-        let result: Result<EventKind, _> = serde_json::from_str(json);
-        assert!(
-            result.is_err(),
-            "missing-field deserialisation must fail for SaVerifierMigrated"
-        );
-    }
-
     /// `SaVerifierDiversificationOverride` round-trip test.
     #[test]
     fn event_kind_sa_verifier_diversification_override_round_trip() {
@@ -6039,17 +6019,6 @@ mod tests {
         assert!(
             s.contains("override_acknowledged_at"),
             "override_acknowledged_at field: {s}"
-        );
-    }
-
-    /// `SaVerifierDiversificationOverride` with missing fields MUST fail to deserialise.
-    #[test]
-    fn event_kind_sa_verifier_diversification_override_missing_fields_fail() {
-        let json = r#"{"kind":"sa_verifier_diversification_override"}"#;
-        let result: Result<EventKind, _> = serde_json::from_str(json);
-        assert!(
-            result.is_err(),
-            "missing-field deserialisation must fail for SaVerifierDiversificationOverride"
         );
     }
 
@@ -6088,17 +6057,6 @@ mod tests {
                 "advised_status wire form '{expected_wire}' must appear: {s}"
             );
         }
-    }
-
-    /// `SaVerifierAllowlistAdvisory` with missing fields MUST fail to deserialise.
-    #[test]
-    fn event_kind_sa_verifier_allowlist_advisory_missing_fields_fail() {
-        let json = r#"{"kind":"sa_verifier_allowlist_advisory"}"#;
-        let result: Result<EventKind, _> = serde_json::from_str(json);
-        assert!(
-            result.is_err(),
-            "missing-field deserialisation must fail for SaVerifierAllowlistAdvisory"
-        );
     }
 
     /// Asserts `SaPolicyAdded` serialises with the correct wire discriminant
@@ -6141,17 +6099,6 @@ mod tests {
         );
     }
 
-    /// `SaPolicyAdded` with missing fields MUST fail to deserialise.
-    #[test]
-    fn event_kind_sa_policy_added_missing_fields_fail() {
-        let json = r#"{"kind":"sa_policy_added"}"#;
-        let result: Result<EventKind, _> = serde_json::from_str(json);
-        assert!(
-            result.is_err(),
-            "missing-field deserialisation must fail for SaPolicyAdded"
-        );
-    }
-
     /// Asserts `SaPolicyRemoved` serialises with the correct wire discriminant
     /// and all required fields, and round-trips cleanly.
     #[test]
@@ -6184,17 +6131,6 @@ mod tests {
         assert!(
             s.contains("\"smart_account_redacted\""),
             "smart_account_redacted field must be present: {s}"
-        );
-    }
-
-    /// `SaPolicyRemoved` with missing fields MUST fail to deserialise.
-    #[test]
-    fn event_kind_sa_policy_removed_missing_fields_fail() {
-        let json = r#"{"kind":"sa_policy_removed"}"#;
-        let result: Result<EventKind, _> = serde_json::from_str(json);
-        assert!(
-            result.is_err(),
-            "missing-field deserialisation must fail for SaPolicyRemoved"
         );
     }
 
@@ -6258,17 +6194,6 @@ mod tests {
         );
     }
 
-    /// `SaSpendingLimitRetuned` with missing fields MUST fail to deserialise.
-    #[test]
-    fn event_kind_sa_spending_limit_retuned_missing_fields_fail() {
-        let json = r#"{"kind":"sa_spending_limit_retuned"}"#;
-        let result: Result<EventKind, _> = serde_json::from_str(json);
-        assert!(
-            result.is_err(),
-            "missing-field deserialisation must fail for SaSpendingLimitRetuned"
-        );
-    }
-
     /// Asserts `SaWeightedThresholdChanged` serialises with the correct wire
     /// discriminant and all required fields, and round-trips cleanly.
     #[test]
@@ -6309,17 +6234,6 @@ mod tests {
         assert!(
             !s.contains("\"request_id\""),
             "SaWeightedThresholdChanged must not carry a request_id field: {s}"
-        );
-    }
-
-    /// `SaWeightedThresholdChanged` with missing fields MUST fail to deserialise.
-    #[test]
-    fn event_kind_sa_weighted_threshold_changed_missing_fields_fail() {
-        let json = r#"{"kind":"sa_weighted_threshold_changed"}"#;
-        let result: Result<EventKind, _> = serde_json::from_str(json);
-        assert!(
-            result.is_err(),
-            "missing-field deserialisation must fail for SaWeightedThresholdChanged"
         );
     }
 
@@ -6376,17 +6290,6 @@ mod tests {
         );
     }
 
-    /// `SaExternalExecuteSubmitted` with missing fields MUST fail to deserialise.
-    #[test]
-    fn event_kind_sa_external_execute_submitted_missing_fields_fail() {
-        let json = r#"{"kind":"sa_external_execute_submitted"}"#;
-        let result: Result<EventKind, _> = serde_json::from_str(json);
-        assert!(
-            result.is_err(),
-            "missing-field deserialisation must fail for SaExternalExecuteSubmitted"
-        );
-    }
-
     /// Asserts `SaSignerWeightChanged` serialises with the correct wire
     /// discriminant and all required fields, and round-trips cleanly.
     #[test]
@@ -6429,17 +6332,6 @@ mod tests {
         assert!(
             !s.contains("\"request_id\""),
             "SaSignerWeightChanged must not carry a request_id field: {s}"
-        );
-    }
-
-    /// `SaSignerWeightChanged` with missing fields MUST fail to deserialise.
-    #[test]
-    fn event_kind_sa_signer_weight_changed_missing_fields_fail() {
-        let json = r#"{"kind":"sa_signer_weight_changed"}"#;
-        let result: Result<EventKind, _> = serde_json::from_str(json);
-        assert!(
-            result.is_err(),
-            "missing-field deserialisation must fail for SaSignerWeightChanged"
         );
     }
 
@@ -6592,17 +6484,6 @@ mod tests {
         );
     }
 
-    /// `ApprovalAttested` with missing required fields MUST fail to deserialise.
-    #[test]
-    fn event_kind_approval_attested_missing_fields_fail() {
-        let json = r#"{"kind":"approval_attested"}"#;
-        let result: Result<EventKind, _> = serde_json::from_str(json);
-        assert!(
-            result.is_err(),
-            "missing-field deserialisation must fail for ApprovalAttested"
-        );
-    }
-
     /// Asserts `ApprovalRejected` serialises with the correct wire discriminant
     /// and all required fields, and round-trips cleanly.
     #[test]
@@ -6622,17 +6503,6 @@ mod tests {
         assert!(s.contains("\"approval_kind\""), "approval_kind field: {s}");
         assert!(s.contains("\"nonce_prefix\""), "nonce_prefix field: {s}");
         assert!(s.contains("\"origin\""), "origin field: {s}");
-    }
-
-    /// `ApprovalRejected` with missing required fields MUST fail to deserialise.
-    #[test]
-    fn event_kind_approval_rejected_missing_fields_fail() {
-        let json = r#"{"kind":"approval_rejected"}"#;
-        let result: Result<EventKind, _> = serde_json::from_str(json);
-        assert!(
-            result.is_err(),
-            "missing-field deserialisation must fail for ApprovalRejected"
-        );
     }
 
     /// Neither new variant's fields collide with the flattened outer
@@ -6728,18 +6598,6 @@ mod tests {
         );
     }
 
-    /// `ApprovalAttestedRemote` with missing required fields MUST fail to
-    /// deserialise.
-    #[test]
-    fn event_kind_approval_attested_remote_missing_fields_fail() {
-        let json = r#"{"kind":"approval_attested_remote"}"#;
-        let result: Result<EventKind, _> = serde_json::from_str(json);
-        assert!(
-            result.is_err(),
-            "missing-field deserialisation must fail for ApprovalAttestedRemote"
-        );
-    }
-
     /// Asserts `ApprovalRejectedRemote` serialises with the correct wire
     /// discriminant and all required fields, and round-trips cleanly.
     #[test]
@@ -6761,18 +6619,6 @@ mod tests {
         assert!(
             s.contains("\"operator_credential_id_redacted\""),
             "operator_credential_id_redacted field: {s}"
-        );
-    }
-
-    /// `ApprovalRejectedRemote` with missing required fields MUST fail to
-    /// deserialise.
-    #[test]
-    fn event_kind_approval_rejected_remote_missing_fields_fail() {
-        let json = r#"{"kind":"approval_rejected_remote"}"#;
-        let result: Result<EventKind, _> = serde_json::from_str(json);
-        assert!(
-            result.is_err(),
-            "missing-field deserialisation must fail for ApprovalRejectedRemote"
         );
     }
 
@@ -7020,16 +6866,6 @@ mod tests {
     }
 
     #[test]
-    fn event_kind_x402_payment_authorized_missing_fields_fail() {
-        let json = r#"{"kind":"x402_payment_authorized"}"#;
-        let result: Result<EventKind, _> = serde_json::from_str(json);
-        assert!(
-            result.is_err(),
-            "missing-field deserialisation must fail for X402PaymentAuthorized"
-        );
-    }
-
-    #[test]
     fn event_kind_opaque_payload_signed_round_trip() {
         let ev = EventKind::OpaquePayloadSigned {
             payload_sha256_redacted: "dfe78222...9d11baf1".to_owned(),
@@ -7058,16 +6894,6 @@ mod tests {
         assert!(
             !s.contains("\"tool\""),
             "tool must NOT appear as a variant field: {s}"
-        );
-    }
-
-    #[test]
-    fn event_kind_opaque_payload_signed_missing_fields_fail() {
-        let json = r#"{"kind":"opaque_payload_signed"}"#;
-        let result: Result<EventKind, _> = serde_json::from_str(json);
-        assert!(
-            result.is_err(),
-            "missing-field deserialisation must fail for OpaquePayloadSigned"
         );
     }
 
@@ -7138,16 +6964,6 @@ mod tests {
         assert!(
             !s.contains("\"tool\""),
             "tool must NOT appear as a variant field: {s}"
-        );
-    }
-
-    #[test]
-    fn event_kind_keyring_key_written_missing_fields_fail() {
-        let json = r#"{"kind":"keyring_key_written"}"#;
-        let result: Result<EventKind, _> = serde_json::from_str(json);
-        assert!(
-            result.is_err(),
-            "missing-field deserialisation must fail for KeyringKeyWritten"
         );
     }
 
@@ -7297,16 +7113,6 @@ mod tests {
         for kind in ["profile_halted", "profile_resumed"] {
             assert!(serde_json::from_value::<EventKind>(serde_json::json!({"kind":kind})).is_err());
         }
-    }
-
-    #[test]
-    fn event_kind_policy_window_state_reset_missing_fields_fail() {
-        let json = r#"{"kind":"policy_window_state_reset"}"#;
-        let result: Result<EventKind, _> = serde_json::from_str(json);
-        assert!(
-            result.is_err(),
-            "missing-field deserialisation must fail for PolicyWindowStateReset"
-        );
     }
 
     #[test]
