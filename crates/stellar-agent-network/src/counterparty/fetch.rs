@@ -580,78 +580,55 @@ mod tests {
 
     // ── validate_home_domain unit tests ──────────────────────────────────────
 
-    #[test]
-    fn valid_domain_passes() {
-        assert!(validate_home_domain("circle.com").is_ok());
-        assert!(validate_home_domain("stellar.org").is_ok());
-        assert!(validate_home_domain("sub.domain.example.com").is_ok());
-        // Hyphenated labels are valid RFC 1035 LDH.
-        assert!(validate_home_domain("my-bank.com").is_ok());
-        assert!(validate_home_domain("sub-domain.example.com").is_ok());
-        // Numeric labels are valid DNS labels.
-        assert!(validate_home_domain("192.168.1.1").is_ok());
+    #[derive(Debug, PartialEq, Eq)]
+    enum HomeDomainOutcome {
+        Valid,
+        HomeDomainInvalid,
+        OtherError,
     }
 
-    #[test]
-    fn uppercase_rejected() {
-        let err = validate_home_domain("Circle.com").unwrap_err();
-        assert!(matches!(err, CounterpartyError::HomeDomainInvalid { .. }));
+    fn classify_home_domain_result(result: &Result<(), CounterpartyError>) -> HomeDomainOutcome {
+        match result {
+            Ok(()) => HomeDomainOutcome::Valid,
+            Err(CounterpartyError::HomeDomainInvalid { .. }) => {
+                HomeDomainOutcome::HomeDomainInvalid
+            }
+            Err(_) => HomeDomainOutcome::OtherError,
+        }
     }
 
+    /// Pins `validate_home_domain` acceptance for valid RFC 1035 LDH domains,
+    /// including hyphenated, numeric, and boundary-length labels up to 255 bytes.
     #[test]
-    fn empty_domain_rejected() {
-        let err = validate_home_domain("").unwrap_err();
-        assert!(matches!(err, CounterpartyError::HomeDomainInvalid { .. }));
+    fn validate_home_domain_accepts_valid_domains() {
+        let cases = [
+            ("simple_dot_com", "circle.com".to_owned()),
+            ("simple_dot_org", "stellar.org".to_owned()),
+            ("nested_subdomain", "sub.domain.example.com".to_owned()),
+            // Hyphenated labels are valid RFC 1035 LDH.
+            ("hyphenated_label", "my-bank.com".to_owned()),
+            ("hyphenated_subdomain", "sub-domain.example.com".to_owned()),
+            // Numeric labels are valid DNS labels.
+            ("numeric_labels", "192.168.1.1".to_owned()),
+            ("length_32_bytes", "a".repeat(32)),
+            ("length_254_bytes", repeated_label_domain(&[63, 63, 63, 62])),
+            ("length_255_bytes", repeated_label_domain(&[63, 63, 63, 63])),
+        ];
+
+        for (name, domain) in cases {
+            let result = validate_home_domain(&domain);
+            assert_eq!(
+                classify_home_domain_result(&result),
+                HomeDomainOutcome::Valid,
+                "case {name}: expected valid home domain {domain:?}, got {result:?}"
+            );
+        }
     }
 
+    /// Pins `validate_home_domain` rejection with `HomeDomainInvalid` across
+    /// case, empty, non-ASCII, control-char, length, delimiter, and URL inputs.
     #[test]
-    fn non_ascii_rejected() {
-        // Cyrillic 'с' (U+0441) — IDN homoglyph attack surface.
-        let err = validate_home_domain("сircle.com").unwrap_err();
-        assert!(matches!(err, CounterpartyError::HomeDomainInvalid { .. }));
-    }
-
-    #[test]
-    fn control_char_rejected() {
-        let err = validate_home_domain("circle\x00.com").unwrap_err();
-        assert!(matches!(err, CounterpartyError::HomeDomainInvalid { .. }));
-    }
-
-    #[test]
-    fn newline_rejected() {
-        let err = validate_home_domain("circle\n.com").unwrap_err();
-        assert!(matches!(err, CounterpartyError::HomeDomainInvalid { .. }));
-    }
-
-    #[test]
-    fn tab_rejected() {
-        let err = validate_home_domain("circle\t.com").unwrap_err();
-        assert!(matches!(err, CounterpartyError::HomeDomainInvalid { .. }));
-    }
-
-    #[test]
-    fn del_char_rejected() {
-        let err = validate_home_domain("circle\x7f.com").unwrap_err();
-        assert!(matches!(err, CounterpartyError::HomeDomainInvalid { .. }));
-    }
-
-    #[test]
-    fn domain_too_long_rejected() {
-        let long_domain = repeated_label_domain(&[63, 63, 63, 62, 1]);
-        let err = validate_home_domain(&long_domain).unwrap_err();
-        assert!(matches!(err, CounterpartyError::HomeDomainInvalid { .. }));
-    }
-
-    #[test]
-    fn domain_length_boundaries_accepted() {
-        let at_limit = "a".repeat(32);
-        assert!(validate_home_domain(&at_limit).is_ok());
-        assert!(validate_home_domain(&repeated_label_domain(&[63, 63, 63, 62])).is_ok());
-        assert!(validate_home_domain(&repeated_label_domain(&[63, 63, 63, 63])).is_ok());
-    }
-
-    #[test]
-    fn oversized_domain_and_label_rejected() {
+    fn validate_home_domain_rejects_invalid_domains() {
         // Total-length cap (separate from label cap): 5 labels of 63 bytes + 4 dots = 319 bytes.
         // Each label is within the 63-byte label cap, so this exercises the 255-byte total cap.
         let too_long_total = format!(
@@ -662,93 +639,57 @@ mod tests {
             "d".repeat(63),
             "e".repeat(63),
         );
-        assert_eq!(too_long_total.len(), 319);
-        let err = validate_home_domain(&too_long_total).unwrap_err();
-        assert!(matches!(err, CounterpartyError::HomeDomainInvalid { .. }));
+        assert_eq!(
+            too_long_total.len(),
+            319,
+            "case oversized_total_319_bytes: fixture length must be 319 bytes"
+        );
 
-        // Defence-in-depth label-cap case: one 1024-byte label is rejected by
-        // the per-label limit before the total-length cap matters.
-        let err = validate_home_domain(&"a".repeat(1024)).unwrap_err();
-        assert!(matches!(err, CounterpartyError::HomeDomainInvalid { .. }));
+        let cases = [
+            ("uppercase", "Circle.com".to_owned()),
+            ("empty", String::new()),
+            // Cyrillic 'с' (U+0441): IDN homoglyph attack surface.
+            ("non_ascii_cyrillic", "сircle.com".to_owned()),
+            ("control_char_nul", "circle\x00.com".to_owned()),
+            ("newline", "circle\n.com".to_owned()),
+            ("tab", "circle\t.com".to_owned()),
+            ("del_char", "circle\x7f.com".to_owned()),
+            (
+                "length_256_bytes",
+                repeated_label_domain(&[63, 63, 63, 62, 1]),
+            ),
+            ("oversized_total_319_bytes", too_long_total),
+            // Defense-in-depth label-cap case: one 1024-byte label is rejected by
+            // the per-label limit before the total-length cap matters.
+            ("oversized_single_label_1024_bytes", "a".repeat(1024)),
+            (
+                "oversized_label_64_bytes",
+                format!("{}.com", "a".repeat(64)),
+            ),
+            // Colon is not RFC 1035 LDH.
+            ("url_scheme", "https://circle.com".to_owned()),
+            // Slash is not RFC 1035 LDH.
+            ("domain_with_path", "circle.com/path".to_owned()),
+            ("leading_whitespace", " circle.com".to_owned()),
+            ("trailing_whitespace", "circle.com ".to_owned()),
+            ("leading_dot", ".circle.com".to_owned()),
+            ("trailing_dot", "circle.com.".to_owned()),
+            ("backslash", "\\foo".to_owned()),
+            ("dotdot_backslash", "..\\foo".to_owned()),
+            ("double_dot_standalone", "..".to_owned()),
+            ("embedded_empty_label", "circle..com".to_owned()),
+            ("query_string", "circle.com?evil=1".to_owned()),
+            ("fragment", "circle.com#fragment".to_owned()),
+        ];
 
-        let err = validate_home_domain(&format!("{}.com", "a".repeat(64))).unwrap_err();
-        assert!(matches!(err, CounterpartyError::HomeDomainInvalid { .. }));
-    }
-
-    #[test]
-    fn url_scheme_rejected() {
-        // Colon is not RFC 1035 LDH.
-        let err = validate_home_domain("https://circle.com").unwrap_err();
-        assert!(matches!(err, CounterpartyError::HomeDomainInvalid { .. }));
-    }
-
-    #[test]
-    fn domain_with_path_rejected() {
-        // Slash is not RFC 1035 LDH.
-        let err = validate_home_domain("circle.com/path").unwrap_err();
-        assert!(matches!(err, CounterpartyError::HomeDomainInvalid { .. }));
-    }
-
-    // ── BLOCKER-4 additional validation tests ─────────────────────────────────
-
-    #[test]
-    fn leading_whitespace_rejected() {
-        let err = validate_home_domain(" circle.com").unwrap_err();
-        assert!(matches!(err, CounterpartyError::HomeDomainInvalid { .. }));
-    }
-
-    #[test]
-    fn trailing_whitespace_rejected() {
-        let err = validate_home_domain("circle.com ").unwrap_err();
-        assert!(matches!(err, CounterpartyError::HomeDomainInvalid { .. }));
-    }
-
-    #[test]
-    fn leading_dot_rejected() {
-        let err = validate_home_domain(".circle.com").unwrap_err();
-        assert!(matches!(err, CounterpartyError::HomeDomainInvalid { .. }));
-    }
-
-    #[test]
-    fn trailing_dot_rejected() {
-        let err = validate_home_domain("circle.com.").unwrap_err();
-        assert!(matches!(err, CounterpartyError::HomeDomainInvalid { .. }));
-    }
-
-    #[test]
-    fn backslash_rejected() {
-        let err = validate_home_domain("\\foo").unwrap_err();
-        assert!(matches!(err, CounterpartyError::HomeDomainInvalid { .. }));
-    }
-
-    #[test]
-    fn dotdot_backslash_rejected() {
-        let err = validate_home_domain("..\\foo").unwrap_err();
-        assert!(matches!(err, CounterpartyError::HomeDomainInvalid { .. }));
-    }
-
-    #[test]
-    fn double_dot_standalone_rejected() {
-        let err = validate_home_domain("..").unwrap_err();
-        assert!(matches!(err, CounterpartyError::HomeDomainInvalid { .. }));
-    }
-
-    #[test]
-    fn embedded_empty_label_rejected() {
-        let err = validate_home_domain("circle..com").unwrap_err();
-        assert!(matches!(err, CounterpartyError::HomeDomainInvalid { .. }));
-    }
-
-    #[test]
-    fn query_string_rejected() {
-        let err = validate_home_domain("circle.com?evil=1").unwrap_err();
-        assert!(matches!(err, CounterpartyError::HomeDomainInvalid { .. }));
-    }
-
-    #[test]
-    fn fragment_rejected() {
-        let err = validate_home_domain("circle.com#fragment").unwrap_err();
-        assert!(matches!(err, CounterpartyError::HomeDomainInvalid { .. }));
+        for (name, domain) in cases {
+            let result = validate_home_domain(&domain);
+            assert_eq!(
+                classify_home_domain_result(&result),
+                HomeDomainOutcome::HomeDomainInvalid,
+                "case {name}: expected HomeDomainInvalid for {domain:?}, got {result:?}"
+            );
+        }
     }
 
     // ── is_private_or_reserved unit tests ────────────────────────────────────

@@ -445,140 +445,190 @@ mod tests {
         }
     }
 
-    #[test]
-    fn redact_rpc_error_redacts_all_url_occurrences() {
-        let raw = "RPC endpoint 'https://private-node.example.com:8443/soroban/rpc?token=SECRET' \
-                   is unreachable: getLedgerEntries failed: error sending request for url \
-                   (https://private-node.example.com:8443/soroban/rpc?token=SECRET)";
-        let redacted = redact_rpc_error(raw);
-
-        assert!(redacted.contains("private-node.example.com:8443"));
-        assert!(!redacted.contains("https://"));
-        assert!(!redacted.contains("/soroban/rpc"));
-        assert!(!redacted.contains("token=SECRET"));
-        assert!(redacted.contains("is unreachable: getLedgerEntries failed:"));
-        assert_eq!(redacted.matches("private-node.example.com:8443").count(), 2);
+    enum RedactExpectation {
+        Exact(&'static str),
+        Predicates {
+            contains: &'static [&'static str],
+            not_contains: &'static [&'static str],
+            not_contains_lowercase: &'static [&'static str],
+            occurrence_count: Option<(&'static str, usize)>,
+        },
     }
 
-    #[test]
-    fn redact_rpc_error_strips_userinfo_and_matches_uppercase_scheme() {
-        let raw = "RPC endpoint 'HTTPS://admin:s3cr3t@private-node.example.com:8443/rpc' \
-                   is unreachable: timed out";
-        let redacted = redact_rpc_error(raw);
-
-        assert!(redacted.contains("private-node.example.com:8443"));
-        assert!(!redacted.contains("admin") && !redacted.contains("s3cr3t"));
-        assert!(!redacted.to_ascii_lowercase().contains("https://"));
-        assert!(!redacted.contains("/rpc"));
+    struct RedactRpcErrorCase {
+        name: &'static str,
+        raw: &'static str,
+        expected: RedactExpectation,
     }
 
+    /// Pins `redact_rpc_error` URL scrubbing across repeated URLs, credentials,
+    /// queries, quotes, JSON-escaped paths, WebSocket schemes, and plain messages.
     #[test]
-    fn redact_rpc_error_strips_query_without_path() {
-        let raw = "fetch failed: https://node.example.com?token=SECRET stop";
-        let redacted = redact_rpc_error(raw);
+    fn redact_rpc_error_cases() {
+        const CASES: &[RedactRpcErrorCase] = &[
+            RedactRpcErrorCase {
+                name: "redacts_all_url_occurrences",
+                raw: "RPC endpoint 'https://private-node.example.com:8443/soroban/rpc?token=SECRET' \
+                      is unreachable: getLedgerEntries failed: error sending request for url \
+                      (https://private-node.example.com:8443/soroban/rpc?token=SECRET)",
+                expected: RedactExpectation::Predicates {
+                    contains: &[
+                        "private-node.example.com:8443",
+                        "is unreachable: getLedgerEntries failed:",
+                    ],
+                    not_contains: &["https://", "/soroban/rpc", "token=SECRET"],
+                    not_contains_lowercase: &[],
+                    occurrence_count: Some(("private-node.example.com:8443", 2)),
+                },
+            },
+            RedactRpcErrorCase {
+                name: "strips_userinfo_and_matches_uppercase_scheme",
+                raw: "RPC endpoint 'HTTPS://admin:s3cr3t@private-node.example.com:8443/rpc' \
+                      is unreachable: timed out",
+                expected: RedactExpectation::Predicates {
+                    contains: &["private-node.example.com:8443"],
+                    not_contains: &["admin", "s3cr3t", "/rpc"],
+                    not_contains_lowercase: &["https://"],
+                    occurrence_count: None,
+                },
+            },
+            RedactRpcErrorCase {
+                name: "strips_query_without_path",
+                raw: "fetch failed: https://node.example.com?token=SECRET stop",
+                expected: RedactExpectation::Predicates {
+                    contains: &["node.example.com", "stop"],
+                    not_contains: &["token=SECRET"],
+                    not_contains_lowercase: &[],
+                    occurrence_count: None,
+                },
+            },
+            RedactRpcErrorCase {
+                name: "strips_userinfo_and_query_containing_comma",
+                raw: "error sending request for url \
+                      (https://user:SECRET@rpc.example.com:8443/rpc?tags=a,b&token=SECRET) for x",
+                expected: RedactExpectation::Exact(
+                    "error sending request for url (rpc.example.com:8443) for x",
+                ),
+            },
+            RedactRpcErrorCase {
+                name: "strips_query_containing_parenthesized_value",
+                raw: "error sending request for url \
+                      (https://rpc.example.com/rpc?f=(x)&token=SECRET): timed out",
+                expected: RedactExpectation::Exact(
+                    "error sending request for url (rpc.example.com): timed out",
+                ),
+            },
+            RedactRpcErrorCase {
+                name: "strips_queries_and_comma_between_urls",
+                raw: "tried https://a.example/x?t=SECRET, https://b.example/y?t=SECRET",
+                expected: RedactExpectation::Exact("tried a.example b.example"),
+            },
+            RedactRpcErrorCase {
+                name: "strips_userinfo_containing_tab",
+                raw: "error for https://user:\tSECRET@rpc.example/x done",
+                expected: RedactExpectation::Exact("error for rpc.example done"),
+            },
+            RedactRpcErrorCase {
+                name: "strips_query_containing_nested_parentheses",
+                raw: "url (https://rpc.example.com/rpc?f=((x))&token=SECRET) end",
+                expected: RedactExpectation::Exact("url (rpc.example.com) end"),
+            },
+            RedactRpcErrorCase {
+                name: "strips_quoted_urls_and_keeps_quotes",
+                raw: r#"url 'https://rpc.example.com/rpc?token=SECRET' and "https://other.example/p?k=SECRET""#,
+                expected: RedactExpectation::Exact(r#"url 'rpc.example.com' and "other.example""#),
+            },
+            RedactRpcErrorCase {
+                name: "passthrough_without_url",
+                raw: "decode error: missing contractspecv0 entry",
+                expected: RedactExpectation::Exact("decode error: missing contractspecv0 entry"),
+            },
+            RedactRpcErrorCase {
+                name: "strips_json_escaped_url_in_raw_data",
+                raw: r#"data: Some(RawValue({"url":"https:\/\/user:SECRET@archive.example.com:8443\/rpc?token=SECRET"}))"#,
+                expected: RedactExpectation::Exact(
+                    r#"data: Some(RawValue({"url":"archive.example.com:8443"}))"#,
+                ),
+            },
+            RedactRpcErrorCase {
+                name: "strips_escaped_http_url_with_mixed_case_scheme",
+                raw: r#"{"a":"HtTp:\/\/node.example\/x\/y?k=SECRET","b":1}"#,
+                expected: RedactExpectation::Exact(r#"{"a":"node.example","b":1}"#),
+            },
+            RedactRpcErrorCase {
+                name: "strips_escaped_url_with_query_and_no_path",
+                raw: r#"{"u":"https:\/\/node.example:443?token=SECRET"} tail"#,
+                expected: RedactExpectation::Exact(r#"{"u":"node.example:443"} tail"#),
+            },
+            RedactRpcErrorCase {
+                name: "strips_escaped_ws_url",
+                raw: r#"{"u":"ws:\/\/user:SECRET@stream.example.com:443\/ws?token=SECRET"} end"#,
+                expected: RedactExpectation::Exact(r#"{"u":"stream.example.com:443"} end"#),
+            },
+            RedactRpcErrorCase {
+                name: "strips_escaped_wss_url_with_mixed_case_scheme",
+                raw: r#"{"u":"WsS:\/\/node.example\/x\/y?k=SECRET","n":1}"#,
+                expected: RedactExpectation::Exact(r#"{"u":"node.example","n":1}"#),
+            },
+            RedactRpcErrorCase {
+                name: "strips_websocket_urls",
+                raw: "stream wss://user:SECRET@stream.example.com:443/ws?token=SECRET closed, \
+                      WS://local.example/x?k=SECRET",
+                expected: RedactExpectation::Exact(
+                    "stream stream.example.com:443 closed, local.example",
+                ),
+            },
+        ];
 
-        assert!(redacted.contains("node.example.com"));
-        assert!(!redacted.contains("token=SECRET"));
-        assert!(redacted.contains("stop"));
-    }
-
-    #[test]
-    fn redact_rpc_error_strips_userinfo_and_query_containing_comma() {
-        let raw = "error sending request for url \
-                   (https://user:SECRET@rpc.example.com:8443/rpc?tags=a,b&token=SECRET) for x";
-        assert_eq!(
-            redact_rpc_error(raw),
-            "error sending request for url (rpc.example.com:8443) for x"
-        );
-    }
-
-    #[test]
-    fn redact_rpc_error_strips_query_containing_parenthesized_value() {
-        let raw = "error sending request for url \
-                   (https://rpc.example.com/rpc?f=(x)&token=SECRET): timed out";
-        assert_eq!(
-            redact_rpc_error(raw),
-            "error sending request for url (rpc.example.com): timed out"
-        );
-    }
-
-    #[test]
-    fn redact_rpc_error_strips_queries_and_comma_between_urls() {
-        let raw = "tried https://a.example/x?t=SECRET, https://b.example/y?t=SECRET";
-        assert_eq!(redact_rpc_error(raw), "tried a.example b.example");
-    }
-
-    #[test]
-    fn redact_rpc_error_strips_userinfo_containing_tab() {
-        let raw = "error for https://user:\tSECRET@rpc.example/x done";
-        assert_eq!(redact_rpc_error(raw), "error for rpc.example done");
-    }
-
-    #[test]
-    fn redact_rpc_error_strips_query_containing_nested_parentheses() {
-        let raw = "url (https://rpc.example.com/rpc?f=((x))&token=SECRET) end";
-        assert_eq!(redact_rpc_error(raw), "url (rpc.example.com) end");
-    }
-
-    #[test]
-    fn redact_rpc_error_strips_quoted_urls_and_keeps_quotes() {
-        let raw = r#"url 'https://rpc.example.com/rpc?token=SECRET' and "https://other.example/p?k=SECRET""#;
-        assert_eq!(
-            redact_rpc_error(raw),
-            r#"url 'rpc.example.com' and "other.example""#
-        );
-    }
-
-    #[test]
-    fn redact_rpc_error_passthrough_without_url() {
-        let raw = "decode error: missing contractspecv0 entry";
-        assert_eq!(redact_rpc_error(raw), raw);
-    }
-
-    #[test]
-    fn redact_rpc_error_strips_json_escaped_url_in_raw_data() {
-        let raw = r#"data: Some(RawValue({"url":"https:\/\/user:SECRET@archive.example.com:8443\/rpc?token=SECRET"}))"#;
-        assert_eq!(
-            redact_rpc_error(raw),
-            r#"data: Some(RawValue({"url":"archive.example.com:8443"}))"#
-        );
-    }
-
-    #[test]
-    fn redact_rpc_error_strips_escaped_http_url_with_mixed_case_scheme() {
-        let raw = r#"{"a":"HtTp:\/\/node.example\/x\/y?k=SECRET","b":1}"#;
-        assert_eq!(redact_rpc_error(raw), r#"{"a":"node.example","b":1}"#);
-    }
-
-    #[test]
-    fn redact_rpc_error_strips_escaped_url_with_query_and_no_path() {
-        let raw = r#"{"u":"https:\/\/node.example:443?token=SECRET"} tail"#;
-        assert_eq!(redact_rpc_error(raw), r#"{"u":"node.example:443"} tail"#);
-    }
-
-    #[test]
-    fn redact_rpc_error_strips_escaped_ws_url() {
-        let raw = r#"{"u":"ws:\/\/user:SECRET@stream.example.com:443\/ws?token=SECRET"} end"#;
-        assert_eq!(
-            redact_rpc_error(raw),
-            r#"{"u":"stream.example.com:443"} end"#
-        );
-    }
-
-    #[test]
-    fn redact_rpc_error_strips_escaped_wss_url_with_mixed_case_scheme() {
-        let raw = r#"{"u":"WsS:\/\/node.example\/x\/y?k=SECRET","n":1}"#;
-        assert_eq!(redact_rpc_error(raw), r#"{"u":"node.example","n":1}"#);
-    }
-
-    #[test]
-    fn redact_rpc_error_strips_websocket_urls() {
-        let raw = "stream wss://user:SECRET@stream.example.com:443/ws?token=SECRET closed, \
-                   WS://local.example/x?k=SECRET";
-        assert_eq!(
-            redact_rpc_error(raw),
-            "stream stream.example.com:443 closed, local.example"
-        );
+        for case in CASES {
+            let redacted = redact_rpc_error(case.raw);
+            match case.expected {
+                RedactExpectation::Exact(want) => {
+                    assert_eq!(
+                        redacted, want,
+                        "case {}: unexpected redacted output",
+                        case.name
+                    );
+                }
+                RedactExpectation::Predicates {
+                    contains,
+                    not_contains,
+                    not_contains_lowercase,
+                    occurrence_count,
+                } => {
+                    for needle in contains {
+                        assert!(
+                            redacted.contains(needle),
+                            "case {}: expected output to contain {needle:?}, got {redacted:?}",
+                            case.name
+                        );
+                    }
+                    for needle in not_contains {
+                        assert!(
+                            !redacted.contains(needle),
+                            "case {}: expected output not to contain {needle:?}, got {redacted:?}",
+                            case.name
+                        );
+                    }
+                    let lower = redacted.to_ascii_lowercase();
+                    for needle in not_contains_lowercase {
+                        assert!(
+                            !lower.contains(needle),
+                            "case {}: expected lowercase output not to contain {needle:?}, got {redacted:?}",
+                            case.name
+                        );
+                    }
+                    if let Some((needle, count)) = occurrence_count {
+                        assert_eq!(
+                            redacted.matches(needle).count(),
+                            count,
+                            "case {}: unexpected occurrence count for {needle:?} in {redacted:?}",
+                            case.name
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

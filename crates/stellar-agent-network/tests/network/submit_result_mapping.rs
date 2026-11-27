@@ -99,8 +99,10 @@ fn send_pending_response(envelope: &SignedTestEnvelope) -> serde_json::Value {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Helper: mounts a FAILED getTransaction response carrying a given
-/// TransactionResultResult XDR body, submits, and returns the error.
-async fn failed_result_error(
+/// TransactionResultResult XDR body, submits, and returns the error,
+/// tagging helper failures with the active table case name.
+async fn failed_result_error_for_case(
+    case: &str,
     envelope: &SignedTestEnvelope,
     tx_result_xdr_b64: String,
 ) -> WalletError {
@@ -131,9 +133,10 @@ async fn failed_result_error(
         .mount(&server)
         .await;
 
-    let client = StellarRpcClient::new(&server.uri()).unwrap();
+    let client = StellarRpcClient::new(&server.uri())
+        .unwrap_or_else(|e| panic!("case {case}: StellarRpcClient::new failed: {e}"));
 
-    submit_transaction_and_wait(
+    match submit_transaction_and_wait(
         &client,
         envelope.envelope_xdr(),
         Duration::from_secs(30),
@@ -142,303 +145,210 @@ async fn failed_result_error(
         None,
     )
     .await
-    .unwrap_err()
+    {
+        Err(err) => err,
+        Ok(ok) => {
+            panic!("case {case}: expected submit_transaction_and_wait error, got Ok({ok:?})")
+        }
+    }
+}
+
+/// Helper: mounts a FAILED getTransaction response carrying a given
+/// TransactionResultResult XDR body, submits, and returns the error.
+async fn failed_result_error(
+    envelope: &SignedTestEnvelope,
+    tx_result_xdr_b64: String,
+) -> WalletError {
+    failed_result_error_for_case("failed_result_error", envelope, tx_result_xdr_b64).await
 }
 
 /// Helper: encodes a unit TransactionResultResult variant (no payload) to base64.
-fn encode_unit_tx_result(result: stellar_xdr::TransactionResultResult) -> String {
+fn encode_unit_tx_result(case: &str, result: stellar_xdr::TransactionResultResult) -> String {
     use stellar_xdr::{Limits, TransactionResult, TransactionResultExt, WriteXdr};
     let tx = TransactionResult {
         fee_charged: 100,
         result,
         ext: TransactionResultExt::V0,
     };
-    tx.to_xdr_base64(Limits::none()).unwrap()
+    tx.to_xdr_base64(Limits::none())
+        .unwrap_or_else(|e| panic!("case {case}: failed to encode TransactionResult XDR: {e}"))
 }
 
-/// TxTooEarly (outer-level): maps to the catch-all `other => OpFailed` arm, NOT
-/// to SequenceNumberStale.  The error code must be "ledger.op_failed".
-#[tokio::test]
-async fn get_failed_tx_too_early_maps_to_op_failed() {
-    use stellar_xdr::TransactionResultResult;
-
-    let envelope = build_signed_envelope(2010);
-    let xdr_b64 = encode_unit_tx_result(TransactionResultResult::TxTooEarly);
-
-    let err = failed_result_error(&envelope, xdr_b64).await;
-
-    assert!(
-        matches!(err, WalletError::Ledger(LedgerError::OpFailed { .. })),
-        "TxTooEarly must map to OpFailed; got: {err:?}"
-    );
-    assert_eq!(
-        err.code(),
-        "ledger.op_failed",
-        "TxTooEarly error code must be ledger.op_failed; got: {}",
-        err.code()
-    );
+enum ForbiddenOuterMapping {
+    None,
+    SequenceNumberStale,
+    TxMalformed,
 }
 
-/// TxTooLate (outer-level): catch-all `other => OpFailed`.
-#[tokio::test]
-async fn get_failed_tx_too_late_maps_to_op_failed() {
-    use stellar_xdr::TransactionResultResult;
-
-    let envelope = build_signed_envelope(2011);
-    let xdr_b64 = encode_unit_tx_result(TransactionResultResult::TxTooLate);
-
-    let err = failed_result_error(&envelope, xdr_b64).await;
-
-    assert!(
-        matches!(err, WalletError::Ledger(LedgerError::OpFailed { .. })),
-        "TxTooLate must map to OpFailed; got: {err:?}"
-    );
-    assert_eq!(err.code(), "ledger.op_failed");
+struct OuterFailedUnitCase {
+    name: &'static str,
+    seq: i64,
+    result: stellar_xdr::TransactionResultResult,
+    expected_code: &'static str,
+    forbidden: ForbiddenOuterMapping,
 }
 
-/// TxMissingOperation (outer-level): catch-all `other => OpFailed`.
+/// Pins that every outer-level unit `TransactionResultResult` variant reaching
+/// the `map_failed_result` catch-all maps to `LedgerError::OpFailed` with code
+/// `ledger.op_failed`, never to `SequenceNumberStale` or `TxMalformed`.
 #[tokio::test]
-async fn get_failed_tx_missing_operation_maps_to_op_failed() {
+async fn get_failed_outer_unit_variants_map_to_op_failed() {
     use stellar_xdr::TransactionResultResult;
 
-    let envelope = build_signed_envelope(2012);
-    let xdr_b64 = encode_unit_tx_result(TransactionResultResult::TxMissingOperation);
+    let cases = [
+        OuterFailedUnitCase {
+            name: "tx_too_early",
+            seq: 2010,
+            result: TransactionResultResult::TxTooEarly,
+            expected_code: "ledger.op_failed",
+            forbidden: ForbiddenOuterMapping::None,
+        },
+        OuterFailedUnitCase {
+            name: "tx_too_late",
+            seq: 2011,
+            result: TransactionResultResult::TxTooLate,
+            expected_code: "ledger.op_failed",
+            forbidden: ForbiddenOuterMapping::None,
+        },
+        OuterFailedUnitCase {
+            name: "tx_missing_operation",
+            seq: 2012,
+            result: TransactionResultResult::TxMissingOperation,
+            expected_code: "ledger.op_failed",
+            forbidden: ForbiddenOuterMapping::None,
+        },
+        // TxBadAuth must NOT map to SequenceNumberStale (exclusively TxBadSeq).
+        OuterFailedUnitCase {
+            name: "tx_bad_auth_outer",
+            seq: 2013,
+            result: TransactionResultResult::TxBadAuth,
+            expected_code: "ledger.op_failed",
+            forbidden: ForbiddenOuterMapping::SequenceNumberStale,
+        },
+        // Outer TxInsufficientBalance falls into the catch-all arm, not the
+        // typed Payment(Underfunded) mapping.
+        OuterFailedUnitCase {
+            name: "tx_insufficient_balance_outer",
+            seq: 2014,
+            result: TransactionResultResult::TxInsufficientBalance,
+            expected_code: "ledger.op_failed",
+            forbidden: ForbiddenOuterMapping::None,
+        },
+        OuterFailedUnitCase {
+            name: "tx_no_account_outer",
+            seq: 2015,
+            result: TransactionResultResult::TxNoAccount,
+            expected_code: "ledger.op_failed",
+            forbidden: ForbiddenOuterMapping::None,
+        },
+        OuterFailedUnitCase {
+            name: "tx_insufficient_fee",
+            seq: 2016,
+            result: TransactionResultResult::TxInsufficientFee,
+            expected_code: "ledger.op_failed",
+            forbidden: ForbiddenOuterMapping::None,
+        },
+        OuterFailedUnitCase {
+            name: "tx_bad_auth_extra",
+            seq: 2017,
+            result: TransactionResultResult::TxBadAuthExtra,
+            expected_code: "ledger.op_failed",
+            forbidden: ForbiddenOuterMapping::None,
+        },
+        OuterFailedUnitCase {
+            name: "tx_internal_error",
+            seq: 2018,
+            result: TransactionResultResult::TxInternalError,
+            expected_code: "ledger.op_failed",
+            forbidden: ForbiddenOuterMapping::None,
+        },
+        OuterFailedUnitCase {
+            name: "tx_not_supported",
+            seq: 2019,
+            result: TransactionResultResult::TxNotSupported,
+            expected_code: "ledger.op_failed",
+            forbidden: ForbiddenOuterMapping::None,
+        },
+        OuterFailedUnitCase {
+            name: "tx_bad_sponsorship",
+            seq: 2020,
+            result: TransactionResultResult::TxBadSponsorship,
+            expected_code: "ledger.op_failed",
+            forbidden: ForbiddenOuterMapping::None,
+        },
+        OuterFailedUnitCase {
+            name: "tx_bad_min_seq_age_or_gap",
+            seq: 2021,
+            result: TransactionResultResult::TxBadMinSeqAgeOrGap,
+            expected_code: "ledger.op_failed",
+            forbidden: ForbiddenOuterMapping::None,
+        },
+        // Outer TxMalformed falls into catch-all OpFailed, distinct from
+        // sendTransaction's SubmissionError::TxMalformed mapping.
+        OuterFailedUnitCase {
+            name: "tx_malformed_outer",
+            seq: 2022,
+            result: TransactionResultResult::TxMalformed,
+            expected_code: "ledger.op_failed",
+            forbidden: ForbiddenOuterMapping::TxMalformed,
+        },
+        OuterFailedUnitCase {
+            name: "tx_soroban_invalid",
+            seq: 2023,
+            result: TransactionResultResult::TxSorobanInvalid,
+            expected_code: "ledger.op_failed",
+            forbidden: ForbiddenOuterMapping::None,
+        },
+        OuterFailedUnitCase {
+            name: "tx_frozen_key_accessed",
+            seq: 2024,
+            result: TransactionResultResult::TxFrozenKeyAccessed,
+            expected_code: "ledger.op_failed",
+            forbidden: ForbiddenOuterMapping::None,
+        },
+    ];
 
-    let err = failed_result_error(&envelope, xdr_b64).await;
+    for case in cases {
+        let envelope = build_signed_envelope(case.seq);
+        let xdr_b64 = encode_unit_tx_result(case.name, case.result);
+        let err = failed_result_error_for_case(case.name, &envelope, xdr_b64).await;
 
-    assert!(
-        matches!(err, WalletError::Ledger(LedgerError::OpFailed { .. })),
-        "TxMissingOperation must map to OpFailed; got: {err:?}"
-    );
-    assert_eq!(err.code(), "ledger.op_failed");
-}
-
-/// TxBadAuth (outer-level): catch-all `other => OpFailed`.
-/// Must NOT map to SequenceNumberStale (that arm is exclusively TxBadSeq).
-#[tokio::test]
-async fn get_failed_tx_bad_auth_outer_maps_to_op_failed() {
-    use stellar_xdr::TransactionResultResult;
-
-    let envelope = build_signed_envelope(2013);
-    let xdr_b64 = encode_unit_tx_result(TransactionResultResult::TxBadAuth);
-
-    let err = failed_result_error(&envelope, xdr_b64).await;
-
-    assert!(
-        matches!(err, WalletError::Ledger(LedgerError::OpFailed { .. })),
-        "TxBadAuth (outer) must map to OpFailed; got: {err:?}"
-    );
-    assert_eq!(err.code(), "ledger.op_failed");
-    // Regression guard: TxBadAuth must NOT produce SequenceNumberStale.
-    assert!(
-        !matches!(
-            err,
-            WalletError::Submission(SubmissionError::SequenceNumberStale)
-        ),
-        "TxBadAuth must NOT map to SequenceNumberStale; got: {err:?}"
-    );
-}
-
-/// TxInsufficientBalance (outer-level): maps to catch-all OpFailed, NOT to
-/// LedgerError::InsufficientBalance (which is only produced by the typed
-/// Payment(Underfunded) arm via map_operation_result).
-#[tokio::test]
-async fn get_failed_tx_insufficient_balance_outer_maps_to_op_failed() {
-    use stellar_xdr::TransactionResultResult;
-
-    let envelope = build_signed_envelope(2014);
-    let xdr_b64 = encode_unit_tx_result(TransactionResultResult::TxInsufficientBalance);
-
-    let err = failed_result_error(&envelope, xdr_b64).await;
-
-    // Outer TxInsufficientBalance falls into the catch-all `other` arm.
-    // The typed InsufficientBalance mapping is ONLY for TxFailed(Payment(Underfunded)).
-    assert!(
-        matches!(err, WalletError::Ledger(LedgerError::OpFailed { .. })),
-        "TxInsufficientBalance (outer) must map to catch-all OpFailed; got: {err:?}"
-    );
-    assert_eq!(err.code(), "ledger.op_failed");
-}
-
-/// TxNoAccount (outer-level): catch-all `other => OpFailed`.
-#[tokio::test]
-async fn get_failed_tx_no_account_outer_maps_to_op_failed() {
-    use stellar_xdr::TransactionResultResult;
-
-    let envelope = build_signed_envelope(2015);
-    let xdr_b64 = encode_unit_tx_result(TransactionResultResult::TxNoAccount);
-
-    let err = failed_result_error(&envelope, xdr_b64).await;
-
-    assert!(
-        matches!(err, WalletError::Ledger(LedgerError::OpFailed { .. })),
-        "TxNoAccount (outer) must map to OpFailed; got: {err:?}"
-    );
-    assert_eq!(err.code(), "ledger.op_failed");
-}
-
-/// TxInsufficientFee (outer-level): catch-all `other => OpFailed`.
-#[tokio::test]
-async fn get_failed_tx_insufficient_fee_maps_to_op_failed() {
-    use stellar_xdr::TransactionResultResult;
-
-    let envelope = build_signed_envelope(2016);
-    let xdr_b64 = encode_unit_tx_result(TransactionResultResult::TxInsufficientFee);
-
-    let err = failed_result_error(&envelope, xdr_b64).await;
-
-    assert!(
-        matches!(err, WalletError::Ledger(LedgerError::OpFailed { .. })),
-        "TxInsufficientFee (outer) must map to OpFailed; got: {err:?}"
-    );
-    assert_eq!(err.code(), "ledger.op_failed");
-}
-
-/// TxBadAuthExtra (outer-level): catch-all `other => OpFailed`.
-#[tokio::test]
-async fn get_failed_tx_bad_auth_extra_maps_to_op_failed() {
-    use stellar_xdr::TransactionResultResult;
-
-    let envelope = build_signed_envelope(2017);
-    let xdr_b64 = encode_unit_tx_result(TransactionResultResult::TxBadAuthExtra);
-
-    let err = failed_result_error(&envelope, xdr_b64).await;
-
-    assert!(
-        matches!(err, WalletError::Ledger(LedgerError::OpFailed { .. })),
-        "TxBadAuthExtra must map to OpFailed; got: {err:?}"
-    );
-    assert_eq!(err.code(), "ledger.op_failed");
-}
-
-/// TxInternalError (outer-level): catch-all `other => OpFailed`.
-#[tokio::test]
-async fn get_failed_tx_internal_error_maps_to_op_failed() {
-    use stellar_xdr::TransactionResultResult;
-
-    let envelope = build_signed_envelope(2018);
-    let xdr_b64 = encode_unit_tx_result(TransactionResultResult::TxInternalError);
-
-    let err = failed_result_error(&envelope, xdr_b64).await;
-
-    assert!(
-        matches!(err, WalletError::Ledger(LedgerError::OpFailed { .. })),
-        "TxInternalError (outer) must map to OpFailed; got: {err:?}"
-    );
-    assert_eq!(err.code(), "ledger.op_failed");
-}
-
-/// TxNotSupported (outer-level): catch-all `other => OpFailed`.
-#[tokio::test]
-async fn get_failed_tx_not_supported_maps_to_op_failed() {
-    use stellar_xdr::TransactionResultResult;
-
-    let envelope = build_signed_envelope(2019);
-    let xdr_b64 = encode_unit_tx_result(TransactionResultResult::TxNotSupported);
-
-    let err = failed_result_error(&envelope, xdr_b64).await;
-
-    assert!(
-        matches!(err, WalletError::Ledger(LedgerError::OpFailed { .. })),
-        "TxNotSupported must map to OpFailed; got: {err:?}"
-    );
-    assert_eq!(err.code(), "ledger.op_failed");
-}
-
-/// TxBadSponsorship (outer-level): catch-all `other => OpFailed`.
-#[tokio::test]
-async fn get_failed_tx_bad_sponsorship_maps_to_op_failed() {
-    use stellar_xdr::TransactionResultResult;
-
-    let envelope = build_signed_envelope(2020);
-    let xdr_b64 = encode_unit_tx_result(TransactionResultResult::TxBadSponsorship);
-
-    let err = failed_result_error(&envelope, xdr_b64).await;
-
-    assert!(
-        matches!(err, WalletError::Ledger(LedgerError::OpFailed { .. })),
-        "TxBadSponsorship must map to OpFailed; got: {err:?}"
-    );
-    assert_eq!(err.code(), "ledger.op_failed");
-}
-
-/// TxBadMinSeqAgeOrGap (outer-level): catch-all `other => OpFailed`.
-#[tokio::test]
-async fn get_failed_tx_bad_min_seq_age_or_gap_maps_to_op_failed() {
-    use stellar_xdr::TransactionResultResult;
-
-    let envelope = build_signed_envelope(2021);
-    let xdr_b64 = encode_unit_tx_result(TransactionResultResult::TxBadMinSeqAgeOrGap);
-
-    let err = failed_result_error(&envelope, xdr_b64).await;
-
-    assert!(
-        matches!(err, WalletError::Ledger(LedgerError::OpFailed { .. })),
-        "TxBadMinSeqAgeOrGap must map to OpFailed; got: {err:?}"
-    );
-    assert_eq!(err.code(), "ledger.op_failed");
-}
-
-/// TxMalformed (outer-level): catch-all `other => OpFailed`.
-/// Must NOT produce SubmissionError::TxMalformed — that mapping is only for
-/// sendTransaction TransactionSubmissionFailed.
-#[tokio::test]
-async fn get_failed_tx_malformed_outer_maps_to_op_failed_not_tx_malformed() {
-    use stellar_xdr::TransactionResultResult;
-
-    let envelope = build_signed_envelope(2022);
-    let xdr_b64 = encode_unit_tx_result(TransactionResultResult::TxMalformed);
-
-    let err = failed_result_error(&envelope, xdr_b64).await;
-
-    // Outer TxMalformed falls to catch-all in map_failed_result → OpFailed.
-    // The TxMalformed arm in map_send_error (for sendTransaction rejection) is distinct.
-    assert!(
-        matches!(err, WalletError::Ledger(LedgerError::OpFailed { .. })),
-        "TxMalformed (outer TransactionResultResult) must map to OpFailed; got: {err:?}"
-    );
-    assert_eq!(err.code(), "ledger.op_failed");
-    assert!(
-        !matches!(
-            err,
-            WalletError::Submission(SubmissionError::TxMalformed { .. })
-        ),
-        "outer TxMalformed must NOT produce SubmissionError::TxMalformed; got: {err:?}"
-    );
-}
-
-/// TxSorobanInvalid (outer-level): catch-all `other => OpFailed`.
-#[tokio::test]
-async fn get_failed_tx_soroban_invalid_maps_to_op_failed() {
-    use stellar_xdr::TransactionResultResult;
-
-    let envelope = build_signed_envelope(2023);
-    let xdr_b64 = encode_unit_tx_result(TransactionResultResult::TxSorobanInvalid);
-
-    let err = failed_result_error(&envelope, xdr_b64).await;
-
-    assert!(
-        matches!(err, WalletError::Ledger(LedgerError::OpFailed { .. })),
-        "TxSorobanInvalid must map to OpFailed; got: {err:?}"
-    );
-    assert_eq!(err.code(), "ledger.op_failed");
-}
-
-/// TxFrozenKeyAccessed (outer-level): catch-all `other => OpFailed`.
-#[tokio::test]
-async fn get_failed_tx_frozen_key_accessed_maps_to_op_failed() {
-    use stellar_xdr::TransactionResultResult;
-
-    let envelope = build_signed_envelope(2024);
-    let xdr_b64 = encode_unit_tx_result(TransactionResultResult::TxFrozenKeyAccessed);
-
-    let err = failed_result_error(&envelope, xdr_b64).await;
-
-    assert!(
-        matches!(err, WalletError::Ledger(LedgerError::OpFailed { .. })),
-        "TxFrozenKeyAccessed must map to OpFailed; got: {err:?}"
-    );
-    assert_eq!(err.code(), "ledger.op_failed");
+        assert!(
+            matches!(err, WalletError::Ledger(LedgerError::OpFailed { .. })),
+            "case {}: must map to OpFailed; got: {err:?}",
+            case.name
+        );
+        assert_eq!(
+            err.code(),
+            case.expected_code,
+            "case {}: error code mismatch; got: {}",
+            case.name,
+            err.code()
+        );
+        match case.forbidden {
+            ForbiddenOuterMapping::None => {}
+            ForbiddenOuterMapping::SequenceNumberStale => {
+                assert!(
+                    !matches!(
+                        err,
+                        WalletError::Submission(SubmissionError::SequenceNumberStale)
+                    ),
+                    "case {}: must NOT map to SequenceNumberStale; got: {err:?}",
+                    case.name
+                );
+            }
+            ForbiddenOuterMapping::TxMalformed => {
+                assert!(
+                    !matches!(
+                        err,
+                        WalletError::Submission(SubmissionError::TxMalformed { .. })
+                    ),
+                    "case {}: must NOT produce SubmissionError::TxMalformed; got: {err:?}",
+                    case.name
+                );
+            }
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
