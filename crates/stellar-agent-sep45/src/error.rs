@@ -671,308 +671,211 @@ mod tests {
 
     use super::*;
 
+    /// Maps every `Sep45Error` variant to its stable `sep45.*` wire code.
     #[test]
-    fn wire_code_http_error() {
-        assert_eq!(
-            Sep45Error::HttpError {
-                detail: "connection refused".to_owned(),
-            }
-            .wire_code(),
-            "sep45.http_error"
-        );
-    }
+    fn wire_code_maps_every_variant() {
+        let cases = [
+            (
+                "http_error",
+                Sep45Error::HttpError {
+                    detail: "connection refused".to_owned(),
+                },
+                "sep45.http_error",
+            ),
+            (
+                "jwt_parse_error",
+                Sep45Error::JwtParseError {
+                    detail: "missing claims".to_owned(),
+                },
+                "sep45.jwt_parse_error",
+            ),
+            (
+                "jwt_expired",
+                Sep45Error::JwtExpired {
+                    exp_unix: 100,
+                    now_unix: 200,
+                },
+                "sep45.jwt_expired",
+            ),
+            (
+                "xdr_decode_error",
+                Sep45Error::XdrDecodeError {
+                    detail: "base64 decode failed".to_owned(),
+                },
+                "sep45.xdr_decode_error",
+            ),
+            (
+                "invalid_entry_count",
+                Sep45Error::InvalidEntryCount {
+                    found: 0,
+                    expected_min: 1,
+                },
+                "sep45.invalid_entry_count",
+            ),
+            (
+                "missing_server_entry",
+                Sep45Error::MissingServerEntry,
+                "sep45.missing_server_entry",
+            ),
+            (
+                "missing_client_entry",
+                Sep45Error::MissingClientEntry,
+                "sep45.missing_client_entry",
+            ),
+            (
+                "unsupported_credential_type",
+                Sep45Error::UnsupportedCredentialType { entry_index: 0 },
+                "sep45.unsupported_credential_type",
+            ),
+            (
+                "invalid_expected_contract_arg",
+                Sep45Error::InvalidExpectedContractArg {
+                    detail: "not a valid C-strkey".to_owned(),
+                },
+                "sep45.invalid_expected_contract_arg",
+            ),
+            (
+                "invalid_expected_server_key_arg",
+                Sep45Error::InvalidExpectedServerKeyArg {
+                    detail: "not a valid G-strkey".to_owned(),
+                },
+                "sep45.invalid_expected_server_key_arg",
+            ),
+            (
+                "invalid_contract_address",
+                Sep45Error::InvalidContractAddress {
+                    found: "CABC".to_owned(),
+                    expected: "CDEF".to_owned(),
+                },
+                "sep45.invalid_contract_address",
+            ),
+            (
+                "invalid_function_name",
+                Sep45Error::InvalidFunctionName {
+                    found: "wrong_fn".to_owned(),
+                    expected: "web_auth_verify",
+                },
+                "sep45.invalid_function_name",
+            ),
+            (
+                "missing_nonce",
+                Sep45Error::MissingNonce { entry_index: 0 },
+                "sep45.missing_nonce",
+            ),
+            (
+                "nonce_mismatch",
+                Sep45Error::NonceMismatch { entry_index: 1 },
+                "sep45.nonce_mismatch",
+            ),
+            (
+                "invalid_args_count",
+                Sep45Error::InvalidArgsCount {
+                    found: 2,
+                    expected_min: 5,
+                },
+                "sep45.invalid_args_count",
+            ),
+            (
+                "invalid_args_format",
+                Sep45Error::InvalidArgsFormat {
+                    detail: "duplicate key 'nonce' in args map".to_owned(),
+                },
+                "sep45.invalid_args_format",
+            ),
+            (
+                "invalid_account_arg",
+                Sep45Error::InvalidAccountArg {
+                    detail: "account mismatch".to_owned(),
+                },
+                "sep45.invalid_account_arg",
+            ),
+            (
+                "home_domain_mismatch",
+                Sep45Error::HomeDomainMismatch {
+                    found: "evil.com".to_owned(),
+                    expected: "example.com".to_owned(),
+                },
+                "sep45.home_domain_mismatch",
+            ),
+            (
+                "web_auth_domain_mismatch",
+                Sep45Error::WebAuthDomainMismatch {
+                    found: "evil.com".to_owned(),
+                    expected: "auth.example.com".to_owned(),
+                },
+                "sep45.web_auth_domain_mismatch",
+            ),
+            (
+                "web_auth_domain_account_mismatch",
+                Sep45Error::WebAuthDomainAccountMismatch {
+                    found: "GABC".to_owned(),
+                    expected: "GDEF".to_owned(),
+                },
+                "sep45.web_auth_domain_account_mismatch",
+            ),
+            (
+                "missing_client_domain_op",
+                Sep45Error::MissingClientDomainOp,
+                "sep45.missing_client_domain_op",
+            ),
+            (
+                "client_domain_mismatch",
+                Sep45Error::ClientDomainMismatch {
+                    found: "evil.com".to_owned(),
+                    expected: "wallet.example.com".to_owned(),
+                },
+                "sep45.client_domain_mismatch",
+            ),
+            (
+                "invalid_client_domain_account",
+                Sep45Error::InvalidClientDomainAccount {
+                    detail: "not a G-strkey".to_owned(),
+                },
+                "sep45.invalid_client_domain_account",
+            ),
+            (
+                "unexpected_sub_invocations",
+                Sep45Error::UnexpectedSubInvocations { entry_index: 0 },
+                "sep45.unexpected_sub_invocations",
+            ),
+            (
+                "missing_server_signature",
+                Sep45Error::MissingServerSignature,
+                "sep45.missing_server_signature",
+            ),
+            (
+                "invalid_server_signature",
+                Sep45Error::InvalidServerSignature {
+                    detail: "sig does not verify".to_owned(),
+                },
+                "sep45.invalid_server_signature",
+            ),
+            (
+                "network_passphrase_mismatch",
+                Sep45Error::NetworkPassphraseMismatch {
+                    detail: "server 'Public Glob…' != expected 'Test SDF Ne…'".to_owned(),
+                },
+                "sep45.network_passphrase_mismatch",
+            ),
+            (
+                "invalid_signature_expiration_ledger",
+                Sep45Error::InvalidSignatureExpirationLedger {
+                    detail: "must be non-zero".to_owned(),
+                },
+                "sep45.invalid_signature_expiration_ledger",
+            ),
+            (
+                "mainnet_signing_forbidden",
+                Sep45Error::MainnetSigningForbidden {
+                    detail: "network.mainnet_write_forbidden".to_owned(),
+                },
+                "sep45.mainnet_signing_forbidden",
+            ),
+        ];
 
-    #[test]
-    fn wire_code_jwt_parse_error() {
-        assert_eq!(
-            Sep45Error::JwtParseError {
-                detail: "missing claims".to_owned(),
-            }
-            .wire_code(),
-            "sep45.jwt_parse_error"
-        );
-    }
-
-    #[test]
-    fn wire_code_jwt_expired() {
-        assert_eq!(
-            Sep45Error::JwtExpired {
-                exp_unix: 100,
-                now_unix: 200,
-            }
-            .wire_code(),
-            "sep45.jwt_expired"
-        );
-    }
-
-    #[test]
-    fn wire_code_xdr_decode_error() {
-        assert_eq!(
-            Sep45Error::XdrDecodeError {
-                detail: "base64 decode failed".to_owned(),
-            }
-            .wire_code(),
-            "sep45.xdr_decode_error"
-        );
-    }
-
-    #[test]
-    fn wire_code_invalid_entry_count() {
-        assert_eq!(
-            Sep45Error::InvalidEntryCount {
-                found: 0,
-                expected_min: 1,
-            }
-            .wire_code(),
-            "sep45.invalid_entry_count"
-        );
-    }
-
-    #[test]
-    fn wire_code_missing_server_entry() {
-        assert_eq!(
-            Sep45Error::MissingServerEntry.wire_code(),
-            "sep45.missing_server_entry"
-        );
-    }
-
-    #[test]
-    fn wire_code_missing_client_entry() {
-        assert_eq!(
-            Sep45Error::MissingClientEntry.wire_code(),
-            "sep45.missing_client_entry"
-        );
-    }
-
-    #[test]
-    fn wire_code_unsupported_credential_type() {
-        assert_eq!(
-            Sep45Error::UnsupportedCredentialType { entry_index: 0 }.wire_code(),
-            "sep45.unsupported_credential_type"
-        );
-    }
-
-    #[test]
-    fn wire_code_invalid_expected_contract_arg() {
-        assert_eq!(
-            Sep45Error::InvalidExpectedContractArg {
-                detail: "not a valid C-strkey".to_owned(),
-            }
-            .wire_code(),
-            "sep45.invalid_expected_contract_arg"
-        );
-    }
-
-    #[test]
-    fn wire_code_invalid_expected_server_key_arg() {
-        assert_eq!(
-            Sep45Error::InvalidExpectedServerKeyArg {
-                detail: "not a valid G-strkey".to_owned(),
-            }
-            .wire_code(),
-            "sep45.invalid_expected_server_key_arg"
-        );
-    }
-
-    #[test]
-    fn wire_code_invalid_contract_address() {
-        assert_eq!(
-            Sep45Error::InvalidContractAddress {
-                found: "CABC".to_owned(),
-                expected: "CDEF".to_owned(),
-            }
-            .wire_code(),
-            "sep45.invalid_contract_address"
-        );
-    }
-
-    #[test]
-    fn wire_code_invalid_function_name() {
-        assert_eq!(
-            Sep45Error::InvalidFunctionName {
-                found: "wrong_fn".to_owned(),
-                expected: "web_auth_verify",
-            }
-            .wire_code(),
-            "sep45.invalid_function_name"
-        );
-    }
-
-    #[test]
-    fn wire_code_missing_nonce() {
-        assert_eq!(
-            Sep45Error::MissingNonce { entry_index: 0 }.wire_code(),
-            "sep45.missing_nonce"
-        );
-    }
-
-    #[test]
-    fn wire_code_nonce_mismatch() {
-        assert_eq!(
-            Sep45Error::NonceMismatch { entry_index: 1 }.wire_code(),
-            "sep45.nonce_mismatch"
-        );
-    }
-
-    #[test]
-    fn wire_code_invalid_args_count() {
-        assert_eq!(
-            Sep45Error::InvalidArgsCount {
-                found: 2,
-                expected_min: 5,
-            }
-            .wire_code(),
-            "sep45.invalid_args_count"
-        );
-    }
-
-    #[test]
-    fn wire_code_invalid_args_format() {
-        assert_eq!(
-            Sep45Error::InvalidArgsFormat {
-                detail: "duplicate key 'nonce' in args map".to_owned(),
-            }
-            .wire_code(),
-            "sep45.invalid_args_format"
-        );
-    }
-
-    #[test]
-    fn wire_code_invalid_account_arg() {
-        assert_eq!(
-            Sep45Error::InvalidAccountArg {
-                detail: "account mismatch".to_owned(),
-            }
-            .wire_code(),
-            "sep45.invalid_account_arg"
-        );
-    }
-
-    #[test]
-    fn wire_code_home_domain_mismatch() {
-        assert_eq!(
-            Sep45Error::HomeDomainMismatch {
-                found: "evil.com".to_owned(),
-                expected: "example.com".to_owned(),
-            }
-            .wire_code(),
-            "sep45.home_domain_mismatch"
-        );
-    }
-
-    #[test]
-    fn wire_code_web_auth_domain_mismatch() {
-        assert_eq!(
-            Sep45Error::WebAuthDomainMismatch {
-                found: "evil.com".to_owned(),
-                expected: "auth.example.com".to_owned(),
-            }
-            .wire_code(),
-            "sep45.web_auth_domain_mismatch"
-        );
-    }
-
-    #[test]
-    fn wire_code_web_auth_domain_account_mismatch() {
-        assert_eq!(
-            Sep45Error::WebAuthDomainAccountMismatch {
-                found: "GABC".to_owned(),
-                expected: "GDEF".to_owned(),
-            }
-            .wire_code(),
-            "sep45.web_auth_domain_account_mismatch"
-        );
-    }
-
-    #[test]
-    fn wire_code_missing_client_domain_op() {
-        assert_eq!(
-            Sep45Error::MissingClientDomainOp.wire_code(),
-            "sep45.missing_client_domain_op"
-        );
-    }
-
-    #[test]
-    fn wire_code_client_domain_mismatch() {
-        assert_eq!(
-            Sep45Error::ClientDomainMismatch {
-                found: "evil.com".to_owned(),
-                expected: "wallet.example.com".to_owned(),
-            }
-            .wire_code(),
-            "sep45.client_domain_mismatch"
-        );
-    }
-
-    #[test]
-    fn wire_code_invalid_client_domain_account() {
-        assert_eq!(
-            Sep45Error::InvalidClientDomainAccount {
-                detail: "not a G-strkey".to_owned(),
-            }
-            .wire_code(),
-            "sep45.invalid_client_domain_account"
-        );
-    }
-
-    #[test]
-    fn wire_code_unexpected_sub_invocations() {
-        assert_eq!(
-            Sep45Error::UnexpectedSubInvocations { entry_index: 0 }.wire_code(),
-            "sep45.unexpected_sub_invocations"
-        );
-    }
-
-    #[test]
-    fn wire_code_missing_server_signature() {
-        assert_eq!(
-            Sep45Error::MissingServerSignature.wire_code(),
-            "sep45.missing_server_signature"
-        );
-    }
-
-    #[test]
-    fn wire_code_invalid_server_signature() {
-        assert_eq!(
-            Sep45Error::InvalidServerSignature {
-                detail: "sig does not verify".to_owned(),
-            }
-            .wire_code(),
-            "sep45.invalid_server_signature"
-        );
-    }
-
-    #[test]
-    fn wire_code_network_passphrase_mismatch() {
-        assert_eq!(
-            Sep45Error::NetworkPassphraseMismatch {
-                detail: "server 'Public Glob…' != expected 'Test SDF Ne…'".to_owned(),
-            }
-            .wire_code(),
-            "sep45.network_passphrase_mismatch"
-        );
-    }
-
-    #[test]
-    fn wire_code_invalid_signature_expiration_ledger() {
-        assert_eq!(
-            Sep45Error::InvalidSignatureExpirationLedger {
-                detail: "must be non-zero".to_owned(),
-            }
-            .wire_code(),
-            "sep45.invalid_signature_expiration_ledger"
-        );
-    }
-
-    #[test]
-    fn wire_code_mainnet_signing_forbidden() {
-        assert_eq!(
-            Sep45Error::MainnetSigningForbidden {
-                detail: "network.mainnet_write_forbidden".to_owned(),
-            }
-            .wire_code(),
-            "sep45.mainnet_signing_forbidden"
-        );
+        for (case, err, expected) in cases {
+            assert_eq!(err.wire_code(), expected, "case {case}");
+        }
     }
 
     /// None of the `Sep45Error` Display or Debug representations should contain

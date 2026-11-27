@@ -492,155 +492,249 @@ mod tests {
 
     use super::*;
 
-    // ── wire_code() correctness ───────────────────────────────────────────────
+    // ── wire_code() and sep43_code() correctness ──────────────────────────────
 
+    /// Maps every `Sep43Error` variant to its `sep43.*` wire code and SEP-43
+    /// integer error code.
     #[test]
-    fn wire_code_wallet_unlock_failed() {
-        assert_eq!(
-            Sep43Error::WalletUnlockFailed {
-                detail: "keyring locked".to_owned(),
-            }
-            .wire_code(),
-            "sep43.wallet_unlock_failed"
-        );
-    }
+    fn error_codes_map_every_variant() {
+        let cases = [
+            (
+                "wallet_unlock_failed",
+                Sep43Error::WalletUnlockFailed {
+                    detail: "keyring locked".to_owned(),
+                },
+                "sep43.wallet_unlock_failed",
+                -1,
+            ),
+            (
+                "signer_unavailable",
+                Sep43Error::SignerUnavailable {
+                    detail: "no key for account".to_owned(),
+                },
+                "sep43.signer_unavailable",
+                -1,
+            ),
+            (
+                "xdr_serialization_failed",
+                Sep43Error::XdrSerializationFailed {
+                    detail: "encode error".to_owned(),
+                },
+                "sep43.xdr_serialization_failed",
+                -1,
+            ),
+            (
+                "keyring_error",
+                Sep43Error::KeyringError {
+                    detail: "platform error".to_owned(),
+                },
+                "sep43.keyring_error",
+                -1,
+            ),
+            (
+                "horizon_error",
+                Sep43Error::HorizonError {
+                    detail: "504 Gateway Timeout".to_owned(),
+                },
+                "sep43.horizon_error",
+                -2,
+            ),
+            (
+                "rpc_error",
+                Sep43Error::RpcError {
+                    detail: "connection refused".to_owned(),
+                },
+                "sep43.rpc_error",
+                -2,
+            ),
+            (
+                "invalid_xdr",
+                Sep43Error::InvalidXdr {
+                    detail: "bad base64".to_owned(),
+                },
+                "sep43.invalid_xdr",
+                -3,
+            ),
+            (
+                "invalid_address",
+                Sep43Error::InvalidAddress {
+                    detail: "not a G-strkey".to_owned(),
+                    expected_type: "G-strkey",
+                },
+                "sep43.invalid_address",
+                -3,
+            ),
+            (
+                "invalid_network_passphrase",
+                Sep43Error::InvalidNetworkPassphrase {
+                    detail: "passphrase mismatch".to_owned(),
+                },
+                "sep43.invalid_network_passphrase",
+                -3,
+            ),
+            (
+                "missing_address",
+                Sep43Error::MissingAddress,
+                "sep43.missing_address",
+                -3,
+            ),
+            (
+                "malformed_auth_entry",
+                Sep43Error::MalformedAuthEntry {
+                    detail: "not Address credentials".to_owned(),
+                },
+                "sep43.malformed_auth_entry",
+                -3,
+            ),
+            (
+                "invalid_message",
+                Sep43Error::InvalidMessage {
+                    detail: "empty message".to_owned(),
+                },
+                "sep43.invalid_message",
+                -3,
+            ),
+            (
+                "mainnet_signing_forbidden",
+                Sep43Error::MainnetSigningForbidden {
+                    detail: "network.mainnet_write_forbidden".to_owned(),
+                },
+                "sep43.mainnet_signing_forbidden",
+                -3,
+            ),
+            (
+                "mainnet_authorization_refused",
+                Sep43Error::MainnetAuthorizationRefused,
+                "sep43.mainnet_authorization_refused",
+                -3,
+            ),
+            (
+                "user_rejected",
+                Sep43Error::UserRejected {
+                    reason: "declined on device".to_owned(),
+                },
+                "sep43.user_rejected",
+                -4,
+            ),
+            (
+                "wallet_unlock_failed_empty_detail",
+                Sep43Error::WalletUnlockFailed {
+                    detail: String::new(),
+                },
+                "sep43.wallet_unlock_failed",
+                -1,
+            ),
+            (
+                "signer_unavailable_empty_detail",
+                Sep43Error::SignerUnavailable {
+                    detail: String::new(),
+                },
+                "sep43.signer_unavailable",
+                -1,
+            ),
+            (
+                "xdr_serialization_failed_empty_detail",
+                Sep43Error::XdrSerializationFailed {
+                    detail: String::new(),
+                },
+                "sep43.xdr_serialization_failed",
+                -1,
+            ),
+            (
+                "keyring_error_empty_detail",
+                Sep43Error::KeyringError {
+                    detail: String::new(),
+                },
+                "sep43.keyring_error",
+                -1,
+            ),
+            (
+                "horizon_error_empty_detail",
+                Sep43Error::HorizonError {
+                    detail: String::new(),
+                },
+                "sep43.horizon_error",
+                -2,
+            ),
+            (
+                "rpc_error_empty_detail",
+                Sep43Error::RpcError {
+                    detail: String::new(),
+                },
+                "sep43.rpc_error",
+                -2,
+            ),
+            (
+                "invalid_xdr_empty_detail",
+                Sep43Error::InvalidXdr {
+                    detail: String::new(),
+                },
+                "sep43.invalid_xdr",
+                -3,
+            ),
+            (
+                "invalid_address_empty_detail",
+                Sep43Error::InvalidAddress {
+                    detail: String::new(),
+                    expected_type: "G-strkey",
+                },
+                "sep43.invalid_address",
+                -3,
+            ),
+            (
+                "invalid_network_passphrase_empty_detail",
+                Sep43Error::InvalidNetworkPassphrase {
+                    detail: String::new(),
+                },
+                "sep43.invalid_network_passphrase",
+                -3,
+            ),
+            (
+                "malformed_auth_entry_empty_detail",
+                Sep43Error::MalformedAuthEntry {
+                    detail: String::new(),
+                },
+                "sep43.malformed_auth_entry",
+                -3,
+            ),
+            (
+                "invalid_message_empty_detail",
+                Sep43Error::InvalidMessage {
+                    detail: String::new(),
+                },
+                "sep43.invalid_message",
+                -3,
+            ),
+            (
+                "mainnet_signing_forbidden_empty_detail",
+                Sep43Error::MainnetSigningForbidden {
+                    detail: String::new(),
+                },
+                "sep43.mainnet_signing_forbidden",
+                -3,
+            ),
+            (
+                "user_rejected_declined",
+                Sep43Error::UserRejected {
+                    reason: "declined".to_owned(),
+                },
+                "sep43.user_rejected",
+                -4,
+            ),
+        ];
 
-    #[test]
-    fn wire_code_signer_unavailable() {
-        assert_eq!(
-            Sep43Error::SignerUnavailable {
-                detail: "no key for account".to_owned(),
-            }
-            .wire_code(),
-            "sep43.signer_unavailable"
-        );
-    }
-
-    #[test]
-    fn wire_code_xdr_serialization_failed() {
-        assert_eq!(
-            Sep43Error::XdrSerializationFailed {
-                detail: "encode error".to_owned(),
-            }
-            .wire_code(),
-            "sep43.xdr_serialization_failed"
-        );
-    }
-
-    #[test]
-    fn wire_code_keyring_error() {
-        assert_eq!(
-            Sep43Error::KeyringError {
-                detail: "platform error".to_owned(),
-            }
-            .wire_code(),
-            "sep43.keyring_error"
-        );
-    }
-
-    #[test]
-    fn wire_code_horizon_error() {
-        assert_eq!(
-            Sep43Error::HorizonError {
-                detail: "504 Gateway Timeout".to_owned(),
-            }
-            .wire_code(),
-            "sep43.horizon_error"
-        );
-    }
-
-    #[test]
-    fn wire_code_rpc_error() {
-        assert_eq!(
-            Sep43Error::RpcError {
-                detail: "connection refused".to_owned(),
-            }
-            .wire_code(),
-            "sep43.rpc_error"
-        );
-    }
-
-    #[test]
-    fn wire_code_invalid_xdr() {
-        assert_eq!(
-            Sep43Error::InvalidXdr {
-                detail: "bad base64".to_owned(),
-            }
-            .wire_code(),
-            "sep43.invalid_xdr"
-        );
-    }
-
-    #[test]
-    fn wire_code_invalid_address() {
-        assert_eq!(
-            Sep43Error::InvalidAddress {
-                detail: "not a G-strkey".to_owned(),
-                expected_type: "G-strkey",
-            }
-            .wire_code(),
-            "sep43.invalid_address"
-        );
-    }
-
-    #[test]
-    fn wire_code_invalid_network_passphrase() {
-        assert_eq!(
-            Sep43Error::InvalidNetworkPassphrase {
-                detail: "passphrase mismatch".to_owned(),
-            }
-            .wire_code(),
-            "sep43.invalid_network_passphrase"
-        );
-    }
-
-    #[test]
-    fn wire_code_missing_address() {
-        assert_eq!(
-            Sep43Error::MissingAddress.wire_code(),
-            "sep43.missing_address"
-        );
-    }
-
-    #[test]
-    fn wire_code_malformed_auth_entry() {
-        assert_eq!(
-            Sep43Error::MalformedAuthEntry {
-                detail: "not Address credentials".to_owned(),
-            }
-            .wire_code(),
-            "sep43.malformed_auth_entry"
-        );
-    }
-
-    #[test]
-    fn wire_code_invalid_message() {
-        assert_eq!(
-            Sep43Error::InvalidMessage {
-                detail: "empty message".to_owned(),
-            }
-            .wire_code(),
-            "sep43.invalid_message"
-        );
-    }
-
-    #[test]
-    fn wire_code_mainnet_signing_forbidden() {
-        assert_eq!(
-            Sep43Error::MainnetSigningForbidden {
-                detail: "network.mainnet_write_forbidden".to_owned(),
-            }
-            .wire_code(),
-            "sep43.mainnet_signing_forbidden"
-        );
-    }
-
-    #[test]
-    fn wire_code_mainnet_authorization_refused() {
-        assert_eq!(
-            Sep43Error::MainnetAuthorizationRefused.wire_code(),
-            "sep43.mainnet_authorization_refused"
-        );
+        for (case, err, expected_wire_code, expected_sep43_code) in cases {
+            assert_eq!(
+                err.wire_code(),
+                expected_wire_code,
+                "case {case}: wire_code"
+            );
+            assert_eq!(
+                err.sep43_code(),
+                expected_sep43_code,
+                "case {case}: sep43_code"
+            );
+        }
     }
 
     /// The authorization refusal names the network code and no precondition.
@@ -650,85 +744,6 @@ mod tests {
             Sep43Error::MainnetAuthorizationRefused.to_string(),
             "mainnet signing authorization refused (network.mainnet_authorization_refused)"
         );
-    }
-
-    #[test]
-    fn wire_code_user_rejected() {
-        assert_eq!(
-            Sep43Error::UserRejected {
-                reason: "declined on device".to_owned(),
-            }
-            .wire_code(),
-            "sep43.user_rejected"
-        );
-    }
-
-    // ── sep43_code() integer grouping ─────────────────────────────────────────
-
-    #[test]
-    fn sep43_code_internal_errors_are_minus_one() {
-        let cases: &[Sep43Error] = &[
-            Sep43Error::WalletUnlockFailed {
-                detail: String::new(),
-            },
-            Sep43Error::SignerUnavailable {
-                detail: String::new(),
-            },
-            Sep43Error::XdrSerializationFailed {
-                detail: String::new(),
-            },
-            Sep43Error::KeyringError {
-                detail: String::new(),
-            },
-        ];
-        for err in cases {
-            assert_eq!(err.sep43_code(), -1, "expected -1 for {:?}", err);
-        }
-    }
-
-    #[test]
-    fn sep43_code_external_errors_are_minus_two() {
-        let cases: &[Sep43Error] = &[
-            Sep43Error::HorizonError {
-                detail: String::new(),
-            },
-            Sep43Error::RpcError {
-                detail: String::new(),
-            },
-        ];
-        for err in cases {
-            assert_eq!(err.sep43_code(), -2, "expected -2 for {:?}", err);
-        }
-    }
-
-    #[test]
-    fn sep43_code_client_invalid_errors_are_minus_three() {
-        let cases: &[Sep43Error] = &[
-            Sep43Error::InvalidXdr {
-                detail: String::new(),
-            },
-            Sep43Error::InvalidAddress {
-                detail: String::new(),
-                expected_type: "G-strkey",
-            },
-            Sep43Error::InvalidNetworkPassphrase {
-                detail: String::new(),
-            },
-            Sep43Error::MissingAddress,
-            Sep43Error::MalformedAuthEntry {
-                detail: String::new(),
-            },
-            Sep43Error::InvalidMessage {
-                detail: String::new(),
-            },
-            Sep43Error::MainnetSigningForbidden {
-                detail: String::new(),
-            },
-            Sep43Error::MainnetAuthorizationRefused,
-        ];
-        for err in cases {
-            assert_eq!(err.sep43_code(), -3, "expected -3 for {:?}", err);
-        }
     }
 
     #[test]
@@ -744,17 +759,6 @@ mod tests {
         assert!(
             msg.contains("network.mainnet_write_forbidden"),
             "message must carry the canonical wire code: {msg}"
-        );
-    }
-
-    #[test]
-    fn sep43_code_user_rejected_is_minus_four() {
-        assert_eq!(
-            Sep43Error::UserRejected {
-                reason: "declined".to_owned(),
-            }
-            .sep43_code(),
-            -4
         );
     }
 
