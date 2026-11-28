@@ -75,7 +75,17 @@ A configured mainnet secondary requires `providers.secondary`, a host distinct f
 
 ### Timeout
 
-`--timeout-seconds <SECONDS>` bounds submission and simulation. On `pay`, `claim`, sponsored `accounts create`, and `trustline`, it bounds the send and the confirmation poll; without the flag the profile's `submit_timeout_seconds` applies, then `60`. The [endpoint checks](#endpoint-identity-before-the-first-read) and the reads before the send run under a fixed 30-second pre-send budget instead. On `pool init` the flag also bounds the endpoint identity check, which gets a budget of its own, and the default is `120`.
+`--timeout-seconds <SECONDS>` bounds submission and simulation. On `pay`, `claim`, sponsored `accounts create`, and `trustline`, it bounds the send and the confirmation poll; without the flag the profile's `submit_timeout_seconds` applies, then `60`. On `pool init` the flag also bounds the endpoint identity check, which gets a budget of its own, and the default is `120`.
+
+On those four classic value commands, each CLI endpoint identity check and each readiness check gets its own 30-second budget. The submit layer starts a separate 30-second budget shared by its endpoint identity probe and signer-set read. Source-account reads that use the readiness deadline share that check's budget. These budgets do not cover every read before signing. On mainnet, an earlier signed send-by deadline ends the submit layer's budget first and returns `network.mainnet_authorization_refused`.
+
+For those four classic value verbs, `network.pre_send_timeout` means no transaction is sent.
+A send timeout can leave a transaction that succeeds later.
+`--timeout-seconds 1` can return `submission.tx_timeout` even when the transaction succeeds.
+Check recovery with [`stellar-agent tx status <HASH>`](stellar-ops.md#stellar-agent-tx-status-hash-flags).
+Mainnet recovery requires checked evidence from the primary RPC (`rpc_url`) and the settlement oracle (`oracle_provider_url`).
+`secondary_rpc_url` names a separate endpoint role.
+A `NOT_FOUND` answer alone neither allows a retry nor releases the spending reservation.
 
 ### Output format
 

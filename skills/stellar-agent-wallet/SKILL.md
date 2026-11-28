@@ -506,9 +506,15 @@ signing; stale startup bindings report the restart requirement.
 **The endpoint binds the network.** Prepare and commit probe the client before
 its first action read. Submission checks it again before send. A network
 mismatch uses `network.endpoint_network_mismatch`; unavailable identity uses
-`network.endpoint_identity_unavailable`. A read before the send that outlasts
-the 30-second pre-send budget uses `network.pre_send_timeout`, and nothing is
-sent. A prepare refuses an endpoint that is
+`network.endpoint_identity_unavailable`, including a standalone prepare or
+commit probe timeout. Inside submission, identity and signer-set reads share
+a fresh 30-second pre-send budget. Exhausting it returns
+`network.pre_send_timeout` before any send. On authorized mainnet submission,
+an earlier signed send-by deadline ends it first with
+`network.mainnet_authorization_refused`. The mainnet authorization resolver's
+separate probe timeout also returns `network.mainnet_authorization_refused`.
+A readiness check or source-account read that exceeds its readiness deadline
+returns `network.endpoint_not_ready`. A prepare refuses an endpoint that is
 not healthy or not current with `network.endpoint_not_ready`, and its result
 names the observed ledger as `operational`. Credential refusals use
 `network.rpc_credential_refused`. Authorized mainnet operations require protocol 29 or 30.

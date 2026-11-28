@@ -303,7 +303,7 @@ Only operator rows (`approval_attested`, `approval_attested_remote`, `profile_ha
 - when it opens, right after the tip-anchor check;
 - on every keyed acquisition in a running process, under the same lock as that check;
 - before each row of its own;
-- when the MCP server exits on client EOF, on SIGINT or SIGTERM on Unix, or on Ctrl-C, Ctrl-Break, or console close on Windows, for every keyed writer it caches.
+- when the MCP server exits on client EOF, on SIGINT or SIGTERM on Unix, or on Ctrl-C, Ctrl-Break, or console close on Windows, for cached keyed writers except those marked for eviction.
 
 A command that consumes an approval acquires the writer after it reads the approval and before it loads a signing key. A queued consent row is therefore in the log before the key is touched. `audit reanchor` drains after its repair rows. The repair writer never drains when it opens, and its reporting form never drains.
 

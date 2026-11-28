@@ -424,12 +424,13 @@ went to the audit outbox. That process appends it to the log before any process
 loads a signing key for the approved action. The command refuses and persists nothing
 beside a process that does not drain the outbox (`audit.writer_locked`), and on
 any other audit failure.
-A running MCP server also drains the outbox when it exits: on client EOF, on
-SIGINT or SIGTERM on Unix, and on Ctrl-C, Ctrl-Break, or console close on
-Windows. The exit drain waits at most two seconds for each writer's mutex; a
-writer still held keeps its rows queued for the next draining writer. A second
-shutdown signal or console event exits at once with exit code 3, and
-undelivered rows stay queued.
+A running MCP server also drains every cached keyed writer's outbox when it exits, except those marked for eviction.
+It exits on client EOF, on SIGINT or SIGTERM on Unix, and on Ctrl-C, Ctrl-Break, or console close on Windows.
+The exit drain waits at most two seconds for each writer's mutex.
+The bound covers the mutex wait only, not the drain's filesystem and keyring work.
+A writer still held keeps its rows queued for the next draining writer.
+A second shutdown signal or console event during the shutdown wait or the drain exits at once with exit code 3.
+Undelivered rows stay queued.
 
 Queued success exits zero and includes `audit_code: audit.outbox_queued`; Written omits `audit_code`.
 It returns immediately after persistence, without waiting for delivery.
@@ -729,7 +730,7 @@ edited grant suppresses nothing.
 
 The MCP server acquires its audit writer when an operation needs it, such as a commit preflight before signing. MCP balance reads do not acquire it. Under V1, payment simulations can reconcile overdue reservations, acquire the writer, and deliver owed accounting events.
 
-The registry normally caches the writer and holds its lock until process exit. A replaced-file refusal during acquisition marks the cached writer for eviction. After callers release it, the next acquisition drops it and checks the file at the path against the anchor.
+The registry normally caches the writer and holds its lock until process exit. A replaced-file refusal during acquisition marks the cached writer for eviction. After callers release it, the next acquisition drops it and checks the file at the path against the anchor. When the server exits, it drains the outbox of every cached keyed writer except those marked for eviction. It exits on client EOF, on SIGINT or SIGTERM on Unix, and on Ctrl-C, Ctrl-Break, or console close on Windows. A queued operator row then reaches the log at shutdown; a refused drain leaves it queued and is logged. The drain waits at most two seconds for each cached writer's mutex. The bound covers the mutex wait only, not the drain's filesystem and keyring work. A writer still held after two seconds is logged with its profile, and its rows stay queued for the next draining writer. A second shutdown signal or console event during the shutdown wait or the drain ends the process at once with exit code 3. Rows the drain did not deliver stay queued, as after a crash. The next draining writer appends them in order with their original timestamps.
 
 A server holding that profile's writer blocks rotation or repair, even if the
 operation that acquired it later fails.

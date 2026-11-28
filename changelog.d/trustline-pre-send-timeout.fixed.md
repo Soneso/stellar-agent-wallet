@@ -1,0 +1,1 @@
+- CLI `trustline` reports `network.pre_send_timeout` for a timeout before the send. Its rendered error envelope includes `error.details.preview`.

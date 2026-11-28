@@ -107,7 +107,7 @@ These recur with the same meaning across groups:
 | `--network <NETWORK>` | Optional assertion; must match the profile chain | profile chain |
 | `--rpc-url <URL>` | Testnet override; refused on mainnet; credentials refused; gets the keyring credential only when it equals the profile's `rpc_url` | profile endpoint |
 | `--secondary-rpc-url <URL>` | Testnet override; refused on mainnet; credentials refused; sends no keyring credential | profile secondary |
-| `--timeout-seconds <SECONDS>` | Bounds submission and simulation. On `pay`, `claim`, sponsored `accounts create`, and `trustline`, it bounds the send and the confirmation poll; the endpoint checks and the reads before the send run under a fixed 30-second pre-send budget | `60`; on those four, the profile's `submit_timeout_seconds`, then `60` |
+| `--timeout-seconds <SECONDS>` | Bounds submission and simulation. On `pay`, `claim`, sponsored `accounts create`, and `trustline`, it bounds the send and the confirmation poll; each CLI endpoint identity check and readiness check gets its own 30-second budget. The submit layer's identity probe and signer-set read share a separate 30-second budget. On mainnet, an earlier signed send-by deadline ends that submission budget with `network.mainnet_authorization_refused` | `60`; on those four, the profile's `submit_timeout_seconds`, then `60` |
 | `--output <FORMAT>` | `json` (default) or `table`; not accepted on every command | `json` |
 | `--business-id <ID>` | Names one value operation on `pay`, `claim`, `trustline` and `accounts create`; required on mainnet, validated when supplied elsewhere | none |
 
@@ -504,7 +504,7 @@ and the mainnet fee cap run before the gate and carry no preview.
 
 One JSON envelope: once the clawback gate passes, the typed preview is in `data.preview` on success and in `error.details.preview` when a later step (witness, signing, submission, or the testnet fee cap) fails.
 
-The send and the confirmation poll run under `--timeout-seconds`, else the profile's `submit_timeout_seconds`, else 60 seconds. The endpoint checks and the reads before the send run under a fixed 30-second pre-send budget.
+The send and the confirmation poll run under `--timeout-seconds`, else the profile's `submit_timeout_seconds`, else 60 seconds. Each CLI endpoint identity check and readiness check gets its own 30-second budget. The submit layer's identity probe and signer-set read share a separate 30-second budget. On mainnet, an earlier signed send-by deadline ends that submission budget with `network.mainnet_authorization_refused`.
 
 ```bash
 stellar-agent trustline --from GABC...WXYZ --asset USDC --profile default

@@ -533,7 +533,7 @@ their own `x402.*` code before the `chain_id` check.
 | `stellar_create_account_commit` | Verify the nonce, re-check the envelope, sign, submit. | Signs and submits. Two-phase; approval spine. |
 | `stellar_balances` | Fetch native XLM balance and optional trustline balances. | Read-only. |
 | `stellar_friendbot` | Fund a testnet account via Friendbot. | Mutating, testnet-only; gated. |
-| `stellar_transaction_status` | Reconcile one submitted transaction against the chain and record a reported success, by its receipt or, when the receipt is missing, by its reservation. Returns `record` (with `release_code`, `settlement_evidence: "unavailable"` and an optional `settlement_decision_id`) and `reservation`. `record` is display data and authenticates no settlement. On a mainnet profile an authenticated classic attempt reports cached recovery evidence or `UNKNOWN` and sends no additional transaction lookup. For an unmanaged record the call also consults the oracle the enablement binds about the primary's `FAILED` and `NOT_FOUND`, and a negative answer from either retains the reservation. On mainnet it reconciles only with the startup enablement record and a fresh check of it, which refuses with `network.mainnet_write_forbidden`; without a record it answers from the stored state and the primary's lookup. | Reads the chain, writes the wallet's record; moves no value and never sends. The way out of `submission.tx_timeout`. |
+| `stellar_transaction_status` | Reconcile one submitted transaction against the chain and record a reported success, by its receipt or, when the receipt is missing, by its reservation. Returns `record` (with `release_code`, `settlement_evidence: "unavailable"` and an optional `settlement_decision_id`) and `reservation`. `record` is display data and authenticates no settlement. On a mainnet profile an authenticated classic attempt reports cached recovery evidence or `UNKNOWN` and sends no additional transaction lookup. An unmanaged mainnet record gets only a primary status lookup, with no oracle lookup; its answer does not settle the reservation. The legacy reconciliation pass keeps unexpired mainnet reservations pending without a chain request. On mainnet it reconciles only with the startup enablement record and a fresh check of it, which refuses with `network.mainnet_write_forbidden`; without a record it answers from the stored state and the primary's lookup. | Reads the chain, writes the wallet's record; moves no value and never sends. The way out of `submission.tx_timeout`. |
 
 `stellar_transaction_status` refuses with `submission.record_unavailable` when the spending-window file cannot be read.
 
@@ -1376,9 +1376,10 @@ possible spending:
   lookup. A checked recovery decision settles it once this host's clock is at
   least six seconds past the envelope's maxTime. The decision needs identical
   answers from the primary endpoint and the oracle, and the profile's audit
-  writer. An unmanaged record keeps its primary lookup; its `FAILED` or
-  `NOT_FOUND` decides nothing alone, and the oracle named by
-  `oracle_provider_url` is asked as well.
+  writer. An unmanaged record gets only a primary status lookup, with no oracle
+  lookup. That answer does not settle its mainnet reservation; the legacy
+  reconciliation pass keeps unexpired mainnet reservations pending without a
+  chain request.
 - `record.status: "ambiguous"` with `record.release_code:
   "submission.accounting_expired"`: the accounting horizon has passed. The
   horizon is the later of the signed time bound and the first local success
