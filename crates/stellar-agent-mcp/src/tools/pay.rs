@@ -1182,6 +1182,13 @@ impl WalletServer {
         args: StellarPayArgs,
         toolset: Option<ToolsetPreparationContext>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        #[cfg(not(feature = "mainnet-write"))]
+        if self.context.chain_id.is_mainnet()
+            && let Err(result) = self
+                .mainnet_write_admission(stellar_agent_network::mainnet::MainnetConsumer::McpPay)
+        {
+            return Ok(result);
+        }
         // Starting at entry bounds the primary identity check, the readiness
         // check and the reads before the send by one pre-send budget; the
         // profile's submit timeout bounds only the send and the confirmation

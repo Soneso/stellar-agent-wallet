@@ -1,0 +1,1 @@
+- The four classic MCP prepare tools refuse a mainnet profile at entry with `network.mainnet_write_forbidden` in builds without `mainnet-write`, before any endpoint request, key access, or state write.

@@ -515,6 +515,9 @@ for build configuration, admitted operations, and exclusions. Per tool on
   Default builds enable the `mainnet-write` feature. These builds admit the four classic commits and both x402
   payment tools after setup. With the feature off, these tools refuse mainnet
   at entry with the same code.
+- In builds without `mainnet-write`, the four classic prepare tools also refuse
+  a mainnet profile at entry with `network.mainnet_write_forbidden`, before
+  endpoint requests, key access, or state writes.
 - `stellar_toolset_invoke` admits only exact `stellar_pay` and
   `stellar_pay_commit` actions on enabled mainnet profiles. Its signed outer
   rule meets payment minimums and composes with the routed payment policy.
@@ -704,8 +707,11 @@ with `network.mainnet_authorization_refused`. One that answers
 the identity request with HTTP 401 or 403 is refused with
 `network.rpc_credential_refused`. The probe is retried with bounded exponential
 backoff inside the pre-send budget and never falls back to the declaration; an
-answer that does not parse, and a 401 or 403 answer, is not retried. Every
-classic prepare then checks, on the same client and before it reads the account
+answer that does not parse, and a 401 or 403 answer, is not retried.
+In builds without `mainnet-write`, the four classic prepares refuse mainnet at
+entry with `network.mainnet_write_forbidden`, before any endpoint request.
+On testnet and in builds with `mainnet-write`, each classic prepare then checks,
+on the same client and before it reads the account
 it signs against, that the endpoint reports a healthy status and that its
 latest ledger closed within 60 seconds of the host clock; a failed check is
 refused with `network.endpoint_not_ready`.
@@ -751,13 +757,17 @@ An envelope
 carrying no signature is `network.envelope_unsigned`. For fee bumps, this code
 also applies when either the outer or inner transaction has no signature.
 
-The classic prepare tools `stellar_pay`, `stellar_create_account`,
-`stellar_trustline`, and `stellar_claim` run the same check on their client
-before the first read on it. Their commit tools do the same on the client they
+On testnet and in builds with `mainnet-write`, the classic prepare tools
+`stellar_pay`, `stellar_create_account`, `stellar_trustline`, and `stellar_claim`
+run the same check on their client before its first read. Their commit tools do the same on the client they
 submit with. The fee, the sequence, the claim entry, and the account views
 these tools read feed the envelope that is signed or the policy gate. An
-admitted mainnet prepare probes the mainnet endpoint before action reads. A
-prepare refuses a mismatched or unavailable endpoint with its network code. A
+admitted mainnet prepare probes the mainnet endpoint before action reads.
+In builds without `mainnet-write`, these prepares refuse a mainnet profile at
+entry with `network.mainnet_write_forbidden`, before endpoint requests, key
+access, or state writes.
+On testnet and in builds with `mainnet-write`, a prepare refuses a mismatched
+or unavailable endpoint with its network code. A
 commit runs the check before any other
 request and before the single-use nonce is burned, so a refusal there does not
 consume the nonce. The submit layer's own check comes after the nonce is
@@ -1022,6 +1032,9 @@ the unavailable code once proven for `asset` on the server's network, and with
 `validation.contract_payment_invalid` when not proven. On mainnet,
 `stellar_pay_commit` and the toolset payment actions answer the admission and freshness refusals
 (`network.mainnet_write_forbidden`) first; the contract refusal follows them.
+In builds without `mainnet-write`, `stellar_pay` also answers
+`network.mainnet_write_forbidden` at entry on a mainnet profile, before the
+C or W contract refusal.
 The SEP-43 transaction tools keep their own policy decision for such an
 envelope.
 

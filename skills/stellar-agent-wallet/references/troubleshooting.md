@@ -470,8 +470,11 @@ and which protocol it runs, and binds the submission to that answer, not to the
 declared network or `chain_id`. It then verifies every signature on the envelope
 against the network the endpoint reports. The classic payment, sponsored
 account creation, trustline, claim, and pool paths ask the same question
-earlier, before their first read. They ask on the client that sends, and the
-MCP simulate tools ask on their own client. The pay, create-account, trustline,
+earlier, after entry admission and before their first read. They ask on the
+client that sends. MCP simulate tools ask on their own client on testnet and in
+builds with `mainnet-write`. Without that feature, the four classic prepares
+refuse a mainnet profile at entry with `network.mainnet_write_forbidden`, before
+any endpoint request. The pay, create-account, trustline,
 and claim commit tools ask it before the single-use nonce is burned, so a
 refusal at that check leaves the nonce usable. A refusal by the submit layer's
 own check comes after the nonce is consumed.

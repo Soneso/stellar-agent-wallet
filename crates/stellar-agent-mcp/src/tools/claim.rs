@@ -389,6 +389,13 @@ impl WalletServer {
         &self,
         Parameters(args): Parameters<StellarClaimArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        #[cfg(not(feature = "mainnet-write"))]
+        if self.context.chain_id.is_mainnet()
+            && let Err(result) = self
+                .mainnet_write_admission(stellar_agent_network::mainnet::MainnetConsumer::McpClaim)
+        {
+            return Ok(result);
+        }
         // ── Resolve source ────────────────────────────────────────────────────
         let source = args
             .source_account

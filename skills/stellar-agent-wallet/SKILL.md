@@ -378,9 +378,11 @@ commit actions. See `references/toolsets-feature.md`.
   which network it serves and which protocol it runs, binds the submission to
   that answer, then verifies every signature on the envelope against it. The
   classic payment, sponsored account creation, trustline, claim, and pool paths
-  ask the same question earlier, before the first read whose answer they sign
-  or gate on. They ask on the client that sends, and the MCP simulate tools ask
-  on their own client.
+  ask the same question before the first read whose answer they sign or gate on,
+  after entry admission. They ask on the client that sends; MCP simulate tools
+  ask on their own client on testnet and in builds with `mainnet-write`.
+  Without that feature, the four classic MCP prepares refuse a mainnet profile
+  at entry with `network.mainnet_write_forbidden`, before any endpoint request.
   Eight codes carry those refusals:
   - `network.endpoint_network_mismatch`: the endpoint serves a different
     network than declared.
@@ -432,6 +434,9 @@ commit actions. See `references/toolsets-feature.md`.
   rule creation remains excluded. On an admitted mainnet server, an x402 payment
   under Allow returns the payment in one call. Under RequireApproval it takes
   two calls.
+- In builds without `mainnet-write`, the four classic prepare tools also refuse
+  a mainnet profile at entry with `network.mainnet_write_forbidden`, before
+  endpoint requests, key access, or state writes.
 - Every MPP tool refuses `stellar:mainnet` at handler entry with
   `mpp.network_forbidden`. Branch on all three codes,
   `network.mainnet_write_forbidden`, `policy.engine_required`, and
@@ -503,8 +508,12 @@ Report authorization refusal to the operator. Do not switch networks. A retry
 needs fresh preparation and approval. Restart MCP after enablement or policy
 signing; stale startup bindings report the restart requirement.
 
-**The endpoint binds the network.** Prepare and commit probe the client before
-its first action read. Submission checks it again before send. A network
+**The endpoint binds the network.** In builds without `mainnet-write`, the four
+classic prepares refuse a mainnet profile at entry with
+`network.mainnet_write_forbidden`, before endpoint requests, key access, or
+state writes.
+On testnet and in builds with `mainnet-write`, prepare and commit probe the
+client before its first action read. Submission checks it again before send. A network
 mismatch uses `network.endpoint_network_mismatch`; unavailable identity uses
 `network.endpoint_identity_unavailable`, including a standalone prepare or
 commit probe timeout. Inside submission, identity and signer-set reads share

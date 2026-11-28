@@ -903,9 +903,9 @@ async fn simulate_refuses_an_endpoint_serving_another_network_before_any_read() 
     }
 }
 
-/// A simulate on a mainnet profile whose endpoint reports mainnet is refused
-/// with `network.mainnet_write_forbidden` before any read, as an `is_error`
-/// envelope: the simulate step reads the values its commit signs.
+/// A mainnet simulate refuses with `network.mainnet_write_forbidden` in an
+/// `is_error` envelope. Without `mainnet-write`, entry admission sends no
+/// request. With the feature, this fixture probes the endpoint before refusing.
 #[tokio::test]
 #[serial]
 async fn simulate_refuses_an_endpoint_reporting_mainnet() {
@@ -933,6 +933,9 @@ async fn simulate_refuses_an_endpoint_reporting_mainnet() {
         .expect("the refusal is a tool result, not a protocol error");
     let (code, _message, text) = crate::common::assert_business_envelope(&result);
     assert_eq!(code, "network.mainnet_write_forbidden", "{text}");
+    #[cfg(not(feature = "mainnet-write"))]
+    assert!(crate::common::received_methods(&endpoint).await.is_empty());
+    #[cfg(feature = "mainnet-write")]
     assert_eq!(
         crate::common::received_methods(&endpoint).await,
         ["getNetwork"],

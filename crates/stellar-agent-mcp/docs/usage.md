@@ -71,7 +71,10 @@ requires the signed cap. The resolver independently reevaluates effective fees
 and thresholds. An admitted mainnet prepare probes endpoint identity before
 action reads, as does commit before consuming its nonce.
 
-Every classic prepare, on any network, checks that the endpoint reports a
+In builds without `mainnet-write`, the four classic prepares refuse a mainnet
+profile at entry with `network.mainnet_write_forbidden`, before endpoint
+requests, key access, or state writes.
+On testnet and in builds with `mainnet-write`, each classic prepare checks that the endpoint reports a
 healthy status and that its latest ledger closed within 60 seconds of the host
 clock, before it reads the account it signs against. A failed check refuses with
 `network.endpoint_not_ready`. The prepare result carries the observed ledger as
@@ -242,6 +245,9 @@ invocation refuses first. Without a valid `asset` its code is
 memo, `validation.contract_payment_unavailable` once proven for `asset`, and
 `validation.contract_payment_invalid` when not proven. On mainnet the commit's
 admission and freshness refusals come first.
+In builds without `mainnet-write`, `stellar_pay` also answers
+`network.mainnet_write_forbidden` at entry on a mainnet profile, before the
+C or W contract refusal.
 
 **Annotations:** `readOnlyHint=false`, `destructiveHint=false`.
 

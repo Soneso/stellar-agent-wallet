@@ -265,7 +265,10 @@ Friendbot remains scoped to testnet and futurenet. MPP, smart-account writes,
 DeFi, pool submission, generic signing, and toolset rule creation are excluded on mainnet.
 On mainnet, `stellar_toolset_invoke` admits only its exact `stellar_pay` and `stellar_pay_commit` actions; every other toolset action refuses.
 
-Prepare and commit probe the endpoint before action reads on their client.
+In builds without `mainnet-write`, the four classic prepares refuse a mainnet
+profile at entry with `network.mainnet_write_forbidden`, before any endpoint request.
+On testnet and in builds with `mainnet-write`, prepares probe the endpoint before
+action reads on their client. Commits probe after entry admission.
 Submission checks the sending client again. The endpoint network binds every
 signature. `network.envelope_signed_for_mainnet` means verification fails under
 the endpoint network and succeeds under mainnet. The identity answer also

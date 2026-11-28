@@ -1,14 +1,17 @@
-//! The commit tools, the rule-commit tool, and the SEP-43 sign-and-submit tool
-//! refuse a mainnet context at entry.
+//! The classic prepare tools in feature-off builds, the commit tools, the
+//! rule-commit tool, and SEP-43 sign-and-submit refuse a mainnet context at entry.
 //!
-//! Each case runs on the Noop engine and, as a separate test, on an engine
+//! Each commit case runs on the Noop engine and, as a separate test, on an engine
 //! that allows every call, so the refusal is shown to precede the policy gate
-//! whatever its verdict. The profile endpoint is a mock server that must
+//! whatever its verdict. Prepare cases use the allow-all engine. One prepare
+//! case selects V1 in the profile without supplying verified mainnet authority.
+//! The profile endpoint is a mock server that must
 //! receive no request. The tool refusal precedes every key access. Server
 //! construction reads the keyring and registers the platform store when none
 //! is registered, so each test installs a fresh, empty mock store and holds
-//! the `keyring` serial key. The envelopes are well formed, so a call that
-//! passed the refusal would reach the policy gate and beyond.
+//! the `keyring` serial key. Commit envelopes are well formed, so a commit that
+//! passed the refusal would reach the policy gate and beyond. Prepare arguments
+//! are valid, so a prepare that passed admission would reach the endpoint.
 
 #![allow(
     clippy::unwrap_used,
@@ -99,6 +102,121 @@ async fn assert_refused_without_requests(
         received.is_empty(),
         "a refused mainnet call must send no request; got {}",
         received.len()
+    );
+}
+
+#[cfg(not(feature = "mainnet-write"))]
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn pay_prepare_refuses_mainnet_at_entry() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let rpc = wiremock::MockServer::start().await;
+    let server = mainnet_server(&rpc.uri(), true);
+    let args = serde_json::from_value(serde_json::json!({
+        "chain_id": "stellar:mainnet",
+        "source": SOURCE_G,
+        "destination": DEST_G,
+        "amount": "10 XLM",
+        "asset": "native"
+    }))
+    .unwrap();
+    let result = server.call_stellar_pay(args).await;
+    assert_refused_without_requests(&rpc, result).await;
+}
+
+#[cfg(not(feature = "mainnet-write"))]
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn claim_prepare_refuses_mainnet_at_entry() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let rpc = wiremock::MockServer::start().await;
+    let server = mainnet_server(&rpc.uri(), true);
+    let args = serde_json::from_value(serde_json::json!({
+        "chain_id": "stellar:mainnet",
+        "source_account": SOURCE_G,
+        "balance_id": format!("00000000{}", "07".repeat(32))
+    }))
+    .unwrap();
+    let result = server.call_stellar_claim(args).await;
+    assert_refused_without_requests(&rpc, result).await;
+}
+
+#[cfg(not(feature = "mainnet-write"))]
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn create_account_prepare_refuses_mainnet_at_entry() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let rpc = wiremock::MockServer::start().await;
+    let server = mainnet_server(&rpc.uri(), true);
+    let args = serde_json::from_value(serde_json::json!({
+        "chain_id": "stellar:mainnet",
+        "source": SOURCE_G,
+        "destination": DEST_G,
+        "starting_balance": "1 XLM"
+    }))
+    .unwrap();
+    let result = server.call_stellar_create_account(args).await;
+    assert_refused_without_requests(&rpc, result).await;
+}
+
+#[cfg(not(feature = "mainnet-write"))]
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn trustline_prepare_refuses_mainnet_at_entry() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let rpc = wiremock::MockServer::start().await;
+    let server = mainnet_server(&rpc.uri(), true);
+    let args = serde_json::from_value(serde_json::json!({
+        "chain_id": "stellar:mainnet",
+        "from": SOURCE_G,
+        "asset": format!("USDC:{DEST_G}")
+    }))
+    .unwrap();
+    let result = server.call_stellar_trustline(args).await;
+    assert_refused_without_requests(&rpc, result).await;
+}
+
+/// A V1 profile reaches the authority check after the engine selection.
+#[cfg(not(feature = "mainnet-write"))]
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn pay_v1_profile_refuses_mainnet_at_entry() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let rpc = wiremock::MockServer::start().await;
+    let mut server = mainnet_server(&rpc.uri(), true);
+    // Keep the allow-all evaluator to isolate admission from policy evaluation.
+    // V1 selection without verified authority must still refuse before any RPC.
+    Arc::make_mut(&mut server.profile).policy.engine =
+        stellar_agent_core::profile::schema::PolicyEngineKind::V1;
+    let args = serde_json::from_value(serde_json::json!({
+        "chain_id": "stellar:mainnet",
+        "source": SOURCE_G,
+        "destination": DEST_G,
+        "amount": "10 XLM",
+        "asset": "native"
+    }))
+    .unwrap();
+    let result = server.call_stellar_pay(args).await.unwrap();
+    assert_refused_without_requests(&rpc, Ok(result.clone())).await;
+    let (_, message, _) = crate::tools::common::assert_business_envelope(&result);
+    assert_eq!(
+        message,
+        "network.mainnet_write_forbidden: mainnet writes require a verified mainnet policy"
     );
 }
 

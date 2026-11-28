@@ -1023,9 +1023,13 @@ tool.
    - x402: the signed re-simulation sends the signed authorization to the configured RPC. After it, the re-simulation answer checks, the release authorization, the payload encoding, the release consumption, and the pending-approval consumption withhold the payload.
    - Codes: `submission.*`, `x402.rpc_simulate_failed`, `x402.transaction_build_failed`, `x402.unexpected_auth_entries`, `x402.payment_build_failed` (authenticated), encoding codes, approval-store codes, `network.mainnet_authorization_refused` (payload withheld).
 
-Classic preparations check endpoint health and a ledger close time within 60
+In builds without `mainnet-write`, the four classic MCP preparations refuse a
+mainnet profile at entry with `network.mainnet_write_forbidden`, before any endpoint request.
+On testnet and in builds with `mainnet-write`, classic MCP preparations check
+endpoint health and a ledger close time within 60
 seconds of the host clock before the account read. A failed check refuses with
 `network.endpoint_not_ready` in the state of unsigned requests.
+Classic CLI preparations also check readiness after entry admission.
 
 A code can appear in more than one state. For the plain x402 tool, the message
 prefix names the stage: `payment withheld before signed transmission`,
