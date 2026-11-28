@@ -19,8 +19,11 @@ Use --decision-case docs|measured|invalid for one decision-shell branch, or
 """
 
 import ast
+import concurrent.futures
 import hashlib
 import itertools
+import multiprocessing
+import multiprocessing.connection
 import os
 import pathlib
 import pickle
@@ -29,6 +32,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / ".github/scripts/check-workflow-invariants.py"
@@ -3930,43 +3934,42 @@ def changelog_group(label, script):
     return problems
 
 
-def mutation_failures(tmp, selected):
-    """Runs each mutation's entries against the mutated copy, which must
+def mutation_failures(tmp, name, selected):
+    """Runs one mutation's entries against the mutated copy, which must
     fail them, and against the restored copy, which must pass them."""
+    lines = []
     failures = []
     source = SCRIPT.read_text()
     path = pathlib.Path(tmp) / "mutant-check-workflow-invariants.py"
-    for name, (needle, replacement, labels) in MUTATIONS.items():
-        labels = [label for label in labels if not selected or selected == label]
-        if not labels:
-            continue
-        if source.count(needle) != 1:
-            failures.append(f"mutation-{name}: mutation target found {source.count(needle)} times")
-            continue
-        for phase, text in (("mutation", source.replace(needle, replacement, 1)), ("control", source)):
-            ast.parse(text)
-            path.write_text(text)
-            path.touch()
-            if phase == "control":
-                assert hashlib.md5(path.read_bytes()).digest() == hashlib.md5(source.encode()).digest(), "restore differs"
-            for label in labels:
-                problems = entry_problems(pathlib.Path(tmp) / "mutant", label, path)
-                if phase == "mutation" and not problems:
-                    failures.append(f"mutation-{name}: {label}: passes against the mutated check")
-                elif phase == "control" and problems:
-                    failures.append(f"control-{name}: {label}: {'; '.join(problems)}")
-                else:
-                    detail = f": {problems[0].splitlines()[0]}" if problems else ""
-                    print(f"ok   {phase}-{name}: {label}{detail}")
-            if name.startswith("W") and not selected:
-                new_labels = list(CHANGELOG_VARIANTS) + ["W17", "W15 main-only changelog changes pass"]
-                actual = [label for label in new_labels if entry_problems(pathlib.Path(tmp) / "isolation", label, path)]
-                wanted = labels if phase == "mutation" else []
-                if actual != wanted:
-                    failures.append(f"{phase}-{name}: isolation fails: {actual}, expected {wanted}")
-                else:
-                    print(f"ok   {phase}-{name} isolation: {actual}; {len(new_labels)} groups")
-    return failures
+    needle, replacement, labels = MUTATIONS[name]
+    labels = [label for label in labels if not selected or selected == label]
+    if source.count(needle) != 1:
+        failures.append(f"mutation-{name}: mutation target found {source.count(needle)} times")
+        return lines, failures
+    for phase, text in (("mutation", source.replace(needle, replacement, 1)), ("control", source)):
+        ast.parse(text)
+        path.write_text(text)
+        path.touch()
+        if phase == "control":
+            assert hashlib.md5(path.read_bytes()).digest() == hashlib.md5(source.encode()).digest(), "restore differs"
+        for label in labels:
+            problems = entry_problems(pathlib.Path(tmp) / "mutant", label, path)
+            if phase == "mutation" and not problems:
+                failures.append(f"mutation-{name}: {label}: passes against the mutated check")
+            elif phase == "control" and problems:
+                failures.append(f"control-{name}: {label}: {'; '.join(problems)}")
+            else:
+                detail = f": {problems[0].splitlines()[0]}" if problems else ""
+                lines.append(f"ok   {phase}-{name}: {label}{detail}")
+        if name.startswith("W") and not selected:
+            new_labels = list(CHANGELOG_VARIANTS) + ["W17", "W15 main-only changelog changes pass"]
+            actual = [label for label in new_labels if entry_problems(pathlib.Path(tmp) / "isolation", label, path)]
+            wanted = labels if phase == "mutation" else []
+            if actual != wanted:
+                failures.append(f"{phase}-{name}: isolation fails: {actual}, expected {wanted}")
+            else:
+                lines.append(f"ok   {phase}-{name} isolation: {actual}; {len(new_labels)} groups")
+    return lines, failures
 
 
 def apply_edits(root, edits):
@@ -4093,7 +4096,7 @@ def coverage_behavior():
     return problems
 
 
-def coverage_decision(case=None):
+def coverage_decision(case=None, tmp=None):
     """Run the actual decision shell with every result tuple, without actions."""
     step = yaml.safe_load((ROOT / COVERAGE).read_text())["jobs"]["coverage"]["steps"][0]
     problems = []
@@ -4102,7 +4105,7 @@ def coverage_decision(case=None):
         if case and case != label:
             continue
         for changes, off, on in itertools.product(("success", "skipped", "failure", "cancelled", ""), repeat=3):
-            with tempfile.NamedTemporaryFile() as output:
+            with tempfile.NamedTemporaryFile(dir=tmp) as output:
                 result = subprocess.run(["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", step["run"]],
                     env={**os.environ, "MEASURE": measure, "CHANGES": changes, "OFF": off, "ON": on,
                          "GITHUB_OUTPUT": output.name}, capture_output=True, text=True, check=False)
@@ -4258,6 +4261,31 @@ MUTATIONS["nextest-profile-baseline"] = (
     "if profile is not None and profile != NEXTEST_PROFILE:", "if True:", ["test-layout baseline"])
 
 
+def run_unit(tmp, kind, label, selected):
+    """Keep each unit's files private and return its ordered output and failures."""
+    with tempfile.TemporaryDirectory(dir=tmp) as directory:
+        if kind == "coverage-behavior":
+            return [], coverage_behavior()
+        if kind == "coverage-decision":
+            return [], coverage_decision(tmp=directory)
+        if kind == "mutation":
+            return mutation_failures(directory, label, selected)
+        assert kind == "entry", kind
+        problems = entry_problems(pathlib.Path(directory) / "entry", label)
+        if problems:
+            return [], [f"{label}: {'; '.join(problems)}"]
+        return [f"ok   {label}"], []
+
+
+def initialize_worker():
+    """End the worker immediately when its parent exits for any reason."""
+    def exit_on_parent_end():
+        multiprocessing.connection.wait([multiprocessing.parent_process().sentinel])
+        os._exit(1)
+
+    threading.Thread(target=exit_on_parent_end, daemon=True).start()
+
+
 def main():
     if len(sys.argv) == 3 and sys.argv[1] == "--decision-case":
         if sys.argv[2] not in ("docs", "measured", "invalid"):
@@ -4280,7 +4308,51 @@ def main():
             return 2
     elif len(sys.argv) != 1:
         return 2
-    failures = [] if selected else coverage_behavior() + coverage_decision()
+    units = [] if selected else [("coverage-behavior", None), ("coverage-decision", None)]
+    coverage_count = len(units)
+    units.extend(("entry", label) for label in
+                 [label for label, _ in PASSING] + [case[0] for case in CASES]
+                 if not selected or selected == label)
+    units.extend(("mutation", name) for name, (_, _, labels) in MUTATIONS.items()
+                 if not selected or selected in labels)
+    workers = max(1, len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1))
+    with tempfile.TemporaryDirectory() as tmp:
+        pool = concurrent.futures.ProcessPoolExecutor(
+            max_workers=workers, mp_context=multiprocessing.get_context("spawn"),
+            initializer=initialize_worker)
+        try:
+            futures = [pool.submit(run_unit, tmp, kind, label, selected) for kind, label in units]
+            failures = []
+
+            def collect(future):
+                # Reading in submission order also re-raises worker exceptions here.
+                lines, problems = future.result()
+                for line in lines:
+                    print(line, flush=True)
+                failures.extend(problems)
+
+            for future in futures[:coverage_count]:
+                collect(future)
+            failures.extend(initial_checks(tmp))
+            for future in futures[coverage_count:]:
+                collect(future)
+            pool.shutdown()
+        except BaseException:
+            pool.shutdown(wait=True, cancel_futures=True)
+            raise
+
+    if failures:
+        for failure in failures:
+            print(f"FAIL {failure}", file=sys.stderr)
+        print(f"{len(failures)} workflow invariant case(s) failed", file=sys.stderr)
+        return 1
+    print("workflow invariant tests passed")
+    return 0
+
+
+def initial_checks(tmp):
+    """Run the count checks and clean baseline in the main process."""
+    failures = []
     for label, output, exact_count, expected in COUNT_CASES:
         problem = violation_count_problem(output, exact_count)
         if problem != expected:
@@ -4297,33 +4369,14 @@ def main():
         failures.append(f"{label}: {problems!r}, expected {expected!r}")
     else:
         print(f"ok   {label}")
-    with tempfile.TemporaryDirectory() as tmp:
-        clean = pathlib.Path(tmp) / "clean"
-        copy_tree(clean)
-        rc, output = run_check(clean)
-        if rc != 0:
-            failures.append(f"unmodified tree: exit {rc}: {output.strip()}")
-        else:
-            print("ok   unmodified tree passes")
-
-        for label in [label for label, _ in PASSING] + [case[0] for case in CASES]:
-            if selected and selected != label:
-                continue
-            problems = entry_problems(pathlib.Path(tmp) / "entry", label)
-            if problems:
-                failures.append(f"{label}: {'; '.join(problems)}")
-            else:
-                print(f"ok   {label}")
-
-        failures.extend(mutation_failures(tmp, selected))
-
-    if failures:
-        for failure in failures:
-            print(f"FAIL {failure}", file=sys.stderr)
-        print(f"{len(failures)} workflow invariant case(s) failed", file=sys.stderr)
-        return 1
-    print("workflow invariant tests passed")
-    return 0
+    clean = pathlib.Path(tmp) / "clean"
+    copy_tree(clean)
+    rc, output = run_check(clean)
+    if rc != 0:
+        failures.append(f"unmodified tree: exit {rc}: {output.strip()}")
+    else:
+        print("ok   unmodified tree passes")
+    return failures
 
 
 if __name__ == "__main__":
