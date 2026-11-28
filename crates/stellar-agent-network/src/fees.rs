@@ -155,7 +155,7 @@ impl FeeDistribution {
     }
 }
 
-/// Classic fee percentile selector.
+/// Fee percentile selector for a supplied classic or Soroban distribution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FeePercentile {
     /// p10.
@@ -201,7 +201,7 @@ impl FeePercentile {
         }
     }
 
-    /// Selects this percentile from the classic fee distribution.
+    /// Selects this percentile from the supplied fee distribution.
     #[must_use]
     pub fn select(self, distribution: &FeeDistribution) -> u64 {
         match self {

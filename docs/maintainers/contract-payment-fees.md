@@ -16,9 +16,9 @@ The loader refuses `soroban_resource_fee_cap` as an unknown criterion kind.
 
 ## Lookup and arithmetic API
 
-`sep43_fee_check` in `crates/stellar-agent-mcp/src/tools/sep43_effects.rs` is
-the single production caller of both functions. It applies them to every SEP-43
-transaction whose fee effect carries a resource fee.
+`sep43_fee_check` in `crates/stellar-agent-mcp/src/tools/sep43_effects.rs` applies
+both functions to every SEP-43 transaction whose fee effect carries a resource fee.
+The network SAC builder uses the lookup and the core validator's full-total check.
 
 The network crate exports both functions from `fees` and its crate root:
 
@@ -50,6 +50,47 @@ The policy metadata and arithmetic APIs do not enable contract-call execution.
 G/M payments retain their classic fee rules and do not require the new field.
 Verified classic-asset SAC transfers describe payment value; their full fee
 bound is separate from per-operation classic limits.
+
+## Network SAC construction
+
+`sac_payment::prepare_sac_payment` builds one intent-derived SAC transfer from
+an unmuxed payer to a C recipient. It uses the supplied final sequence once
+and constructs SourceAccount authorization locally for assembled envelopes.
+The simulation envelope has no authorization entries, selecting recording mode.
+The simulation authorization must independently match that exact entry.
+The decoded allocation object contains no authorization to copy.
+Only the validator checks its footprint and restoration indices.
+
+An explicit fee is the inclusion bid. Automatic selection uses the Soroban
+distribution; ProfileDefault uses the supplied default inclusion bid.
+The resource allocation is the greater of the encoded resource fee and the
+reported minimum. Both must fit u32. Checked addition forms the total.
+The current policy cap and the intent's total bound both apply.
+Preparation and rebuild check footprint and restoration before the total cap
+through the same core validator.
+
+Preparation requires the Stellar Asset executable in a live derived SAC instance.
+An empty read does not identify its deployment history.
+Successful simulation must index an absent instance
+for restoration in the same transaction. No separate restore or deployment runs.
+A failed simulation after an empty read returns the combined unavailable-instance
+reason and validated asset text. Transport errors retain their network code.
+
+The checker requires one void result and refuses every restore preamble.
+Each encoded XDR value has a 64 KiB bound and depth limit of 64.
+The retained-data adapter runs the core footprint, restoration and fee validator
+without sorting or repairing keys or indices.
+Restoration indices must be strictly increasing and in bounds before an
+unsupported archived key can be reported.
+Identified unsupported archived keys carry their canonical XDR SHA-256 digest.
+
+The C nonce subject binds canonical intent bytes and envelope text under
+`stellar-agent:sac-payment:nonce:v1`, with a NUL terminator and big-endian u64 lengths.
+Absent and explicit zero inclusion bids remain distinct.
+Rebuild checks independent caller terms, uses the presented envelope's fee and
+data, and requires canonical envelope equality. It performs no simulation.
+Classic subjects, durable subjects and mainnet canonical commits retain their
+existing formats. Ordinary MCP, CLI and toolset pay routes still refuse C and W.
 
 ## Reporting
 

@@ -24,6 +24,7 @@
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
+    clippy::panic,
     reason = "integration test; panics/unwraps acceptable"
 )]
 
@@ -47,6 +48,123 @@ use wiremock::{Mock, MockServer};
 const SRC_ACCOUNT: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
 const DST_ACCOUNT: &str = "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL";
 const TESTNET_PASSPHRASE: &str = "Test SDF Network ; September 2015";
+
+#[tokio::test]
+async fn sac_public_prepare_and_retained_rebuild() {
+    use stellar_agent_core::{
+        approval::{ClassicIntent, MemoFact, fixtures::sac_transfer},
+        profile::caip2::Caip2,
+        sac_payment::{SacPaymentContext, verify_sac_payment},
+    };
+    use stellar_agent_network::{
+        fees::ClassicFeeChoice,
+        sac_payment::{
+            SacPaymentBuildRequest, SacPaymentCaller, prepare_sac_payment, rebuild_sac_payment,
+        },
+    };
+    use stellar_xdr::*;
+    let context = SacPaymentContext::new(
+        Caip2::Testnet,
+        stellar_agent_core::approval::IntentAsset::Native,
+    )
+    .unwrap();
+    let original = sac_transfer(&context);
+    let text = TransactionEnvelope::Tx(original.clone())
+        .to_xdr_base64(Limits::none())
+        .unwrap();
+    let payment = verify_sac_payment(&text, &context).unwrap();
+    let base = stellar_agent_network::operation_entry::contract_pay_base(
+        Caip2::Testnet,
+        payment.policy_args()["source"].as_str().unwrap(),
+        [7; 32],
+        MemoFact::None,
+        stellar_agent_network::contract_transfer_fee_cap(Caip2::Testnet, None).unwrap(),
+    )
+    .unwrap();
+    let intent = ClassicIntent::new(base, payment.intent_payload(Some(100))).unwrap();
+    let request = SacPaymentBuildRequest {
+        intent: &intent,
+        context: &context,
+        sequence: 77,
+        conditions: Preconditions::None,
+        fee_choice: ClassicFeeChoice::Explicit(100),
+        default_inclusion_bid: 999,
+        policy: None,
+    };
+    let server = MockServer::start().await;
+    let key = LedgerKey::ContractData(LedgerKeyContractData {
+        contract: payment.invoke().contract_address.clone(),
+        key: ScVal::LedgerKeyContractInstance,
+        durability: ContractDataDurability::Persistent,
+    });
+    let TransactionExt::V1(mut data) = original.tx.ext else {
+        panic!("fixture data")
+    };
+    data.resources.footprint.read_write = vec![key.clone()].try_into().unwrap();
+    data.ext = SorobanTransactionDataExt::V1(SorobanResourcesExtV0 {
+        archived_soroban_entries: vec![0].try_into().unwrap(),
+    });
+    let OperationBody::InvokeHostFunction(host) = &original.tx.operations[0].body else {
+        panic!("fixture host")
+    };
+    Mock::given(body_partial_json(json!({"method":"getLedgerEntries", "params":{"keys":[key.to_xdr_base64(Limits::none()).unwrap()]}})))
+        .respond_with(EchoIdResponder::new(json!({"latestLedger":1000,"entries":[]}))).expect(1).mount(&server).await;
+    let simulation = json!({"latestLedger":1000,"minResourceFee":"500000",
+            "transactionData":data.to_xdr_base64(Limits::none()).unwrap(),
+            "results":[{"xdr":ScVal::Void.to_xdr_base64(Limits::none()).unwrap(),"auth":[host.auth[0].to_xdr_base64(Limits::none()).unwrap()]}]});
+    Mock::given(body_partial_json(json!({"method":"simulateTransaction"})))
+        .respond_with(move |request: &wiremock::Request| {
+            let body: serde_json::Value = request.body_json().unwrap();
+            let envelope = TransactionEnvelope::from_xdr_base64(
+                body["params"]["transaction"].as_str().unwrap(),
+                Limits::none(),
+            )
+            .unwrap();
+            let TransactionEnvelope::Tx(tx) = envelope else {
+                panic!("tx")
+            };
+            let OperationBody::InvokeHostFunction(op) = &tx.tx.operations[0].body else {
+                panic!("host")
+            };
+            let mut result = simulation.clone();
+            if !op.auth.is_empty() {
+                result["results"][0]["auth"] = json!([]);
+            }
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(json!({"jsonrpc":"2.0", "id":body["id"], "result":result}))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = StellarRpcClient::new(&server.uri()).unwrap();
+    let prepared = prepare_sac_payment(&client, &request).await.unwrap();
+    let stellar_agent_core::approval::IntentPayload::ContractPay {
+        destination,
+        asset,
+        amount_stroops,
+        explicit_inclusion_bid_stroops,
+    } = intent.payload()
+    else {
+        panic!("fixture intent")
+    };
+    let caller = SacPaymentCaller {
+        source: intent.base().source(),
+        destination,
+        asset,
+        amount_stroops: *amount_stroops,
+        explicit_inclusion_bid_stroops: *explicit_inclusion_bid_stroops,
+        memo: &MemoFact::None,
+    };
+    assert_eq!(prepared.payment.transaction().ext, TransactionExt::V1(data));
+    assert_eq!(prepared.fee.total_stroops, 500_100);
+    assert_eq!(
+        rebuild_sac_payment(&request, &prepared.envelope_xdr, &caller)
+            .unwrap()
+            .envelope_xdr,
+        prepared.envelope_xdr
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}
 
 /// Seed for the source account of submit-path envelopes. A public test
 /// fixture, never a production key.
