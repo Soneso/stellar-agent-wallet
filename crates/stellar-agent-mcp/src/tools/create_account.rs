@@ -492,6 +492,14 @@ impl WalletServer {
         &self,
         Parameters(args): Parameters<StellarCreateAccountArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        #[cfg(not(feature = "mainnet-write"))]
+        if self.context.chain_id.is_mainnet()
+            && let Err(result) = self.mainnet_write_admission(
+                stellar_agent_network::mainnet::MainnetConsumer::McpCreateAccount,
+            )
+        {
+            return Ok(result);
+        }
         // ── dispatch gate ────────────────────────────────────────────────────
         let mut args_value = json!({
             "chain_id": &args.chain_id,

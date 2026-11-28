@@ -21,6 +21,9 @@ for build configuration, admitted operations, and exclusions. Per tool on
   `--no-default-features` build omits it. These builds admit the four classic commits and both x402
   payment tools after setup. With the feature off, these tools refuse mainnet
   at entry with the same code.
+- In builds without `mainnet-write`, the four classic prepare tools also refuse
+  a mainnet profile at entry with `network.mainnet_write_forbidden`, before
+  endpoint requests, key access, or state writes.
 - On mainnet, `stellar_toolset_invoke` admits only its exact `stellar_pay` and
   `stellar_pay_commit` actions, after the same setup. Its rule-creation
   signing action refuses at entry with `network.mainnet_write_forbidden`.
@@ -418,8 +421,11 @@ refuses. Wallet guards use `network.mainnet_write_forbidden`.
 MPP uses `mpp.network_forbidden`. Noop allows mainnet reads and refuses
 destructive policy decisions with `policy.engine_required`.
 
-The four classic preparations and commits probe endpoint identity before action
-reads. Commit checks before consuming the envelope nonce. Both use the smaller
+In builds without `mainnet-write`, the four classic preparations refuse a mainnet
+profile at entry with `network.mainnet_write_forbidden`, before any endpoint request.
+On testnet and in builds with `mainnet-write`, they probe endpoint identity before
+action reads. Commits probe after admission and before consuming the envelope
+nonce. Both use the smaller
 signed/profile fee cap, or the one available cap. A higher profile value warns.
 The enabled-policy minimum requires the signed field. The resolver independently
 evaluates effective fees and thresholds for the bound action.
@@ -495,11 +501,16 @@ and must match the loaded profile. The x402 requirement `network` spells mainnet
 - `stellar_dex_quote` requires a `chain_id` but never matches it against the
   profile; it selects the router from it.
 
-A mismatch is refused before policy evaluation. On the classic simulate and
-commit tools, the endpoint check and the account reads come first, so an
-endpoint refusal precedes the `chain_id` check there. The x402 payment tools
+A mismatch is refused before policy evaluation. On testnet and in builds with
+`mainnet-write`, classic simulate tools check the endpoint and read accounts
+before checking `chain_id`. Commit tools do those reads after entry admission.
+An endpoint refusal precedes the `chain_id` check on these paths. The x402 payment tools
 validate their payment requirements first, so invalid requirements answer
 their own `x402.*` code before the `chain_id` check.
+
+In builds without `mainnet-write`, the four classic prepares refuse a mainnet
+profile at entry with `network.mainnet_write_forbidden`, before endpoint
+requests, key access, or state writes.
 
 ## Amount and asset conventions
 

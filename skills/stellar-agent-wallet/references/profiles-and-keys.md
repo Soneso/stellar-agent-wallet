@@ -809,9 +809,12 @@ for an admitted operation.
 That layer binds each submission to the network the RPC endpoint reports it
 serves, not to the profile's declared `network_passphrase`. A profile whose
 `rpc_url` and network do not name the same chain is refused before anything is
-sent (`network.endpoint_network_mismatch`). The classic payment, sponsored
-account creation, trustline, claim, and pool paths refuse it before their
-first read. The same answer carries the endpoint's protocol version, checked
+sent (`network.endpoint_network_mismatch`) on paths that reach the endpoint.
+In builds without `mainnet-write`, the four classic MCP prepares refuse a mainnet
+profile at entry with `network.mainnet_write_forbidden`, before any endpoint request.
+After entry admission, classic payment, sponsored account creation, trustline,
+claim, and pool paths check endpoint identity before their first read.
+The same answer carries the endpoint's protocol version, checked
 against the supported range as
 [cli-reference.md](cli-reference.md#submit-layer-network-binding) describes.
 MPP refuses mainnet with `mpp.network_forbidden` instead of

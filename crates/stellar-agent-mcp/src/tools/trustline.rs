@@ -14,6 +14,11 @@
 //!
 //! # Gate order on the live path (fail-closed at every step)
 //!
+//! In builds without `mainnet-write`, prepare refuses a mainnet profile at entry
+//! with `network.mainnet_write_forbidden`, before denomination resolution or any
+//! endpoint request, key access, or state write. The following steps describe
+//! preparation on testnet and in builds with `mainnet-write`.
+//!
 //! 1. `resolve_denomination` — USDT hard-refusal + lookalike denylist +
 //!    pinned-issuer-mismatch + unpinned-bare-code.
 //! 2. Endpoint identity check on the simulate client
@@ -626,6 +631,14 @@ impl WalletServer {
         &self,
         Parameters(args): Parameters<StellarTrustlineArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        #[cfg(not(feature = "mainnet-write"))]
+        if self.context.chain_id.is_mainnet()
+            && let Err(result) = self.mainnet_write_admission(
+                stellar_agent_network::mainnet::MainnetConsumer::McpTrustline,
+            )
+        {
+            return Ok(result);
+        }
         let mut args_value = json!({
             "chain_id": &args.chain_id,
             "from": &args.from,

@@ -66,8 +66,12 @@ they act on the chain of the profile the server was started with. `stellar_tools
 to the routed tool, which may itself require it (a routed `stellar_balances` or
 `stellar_pay` does). `stellar_dex_quote` requires a `chain_id` but never
 matches it against the profile; it selects the router from it. A mismatch is
-refused before signing. The classic simulate and commit tools read the
-endpoint and the accounts first.
+refused before signing. On testnet and in builds with `mainnet-write`, the
+classic simulate tools read the endpoint and accounts before checking the
+argument. Commit tools do those reads after entry admission.
+In builds without `mainnet-write`, the four classic prepares refuse a mainnet
+profile at entry with `network.mainnet_write_forbidden`, before endpoint
+requests, key access, or state writes.
 
 ## The result envelope
 

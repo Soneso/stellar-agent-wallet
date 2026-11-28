@@ -1079,8 +1079,32 @@ tests = [
 
 [[cell]]
 claim = "feature.off_build_refuses_mainnet"
-rows = ["mcp.pay", "mcp.create_account", "mcp.claim", "mcp.trustline"]
-not_applicable = "prepare signs and submits nothing and reads only network and ledger state; the matching commit refuses mainnet before any request"
+rows = ["mcp.pay"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::mainnet_entry_refusal_tests::pay_prepare_refuses_mainnet_at_entry", builds = "feature-off" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::mainnet_entry_refusal_tests::pay_v1_profile_refuses_mainnet_at_entry", builds = "feature-off" },
+]
+
+[[cell]]
+claim = "feature.off_build_refuses_mainnet"
+rows = ["mcp.create_account"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::mainnet_entry_refusal_tests::create_account_prepare_refuses_mainnet_at_entry", builds = "feature-off" },
+]
+
+[[cell]]
+claim = "feature.off_build_refuses_mainnet"
+rows = ["mcp.claim"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::mainnet_entry_refusal_tests::claim_prepare_refuses_mainnet_at_entry", builds = "feature-off" },
+]
+
+[[cell]]
+claim = "feature.off_build_refuses_mainnet"
+rows = ["mcp.trustline"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::mainnet_entry_refusal_tests::trustline_prepare_refuses_mainnet_at_entry", builds = "feature-off" },
+]
 
 [[cell]]
 claim = "feature.off_build_refuses_mainnet"

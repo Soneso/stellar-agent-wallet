@@ -2006,11 +2006,13 @@ impl WalletServer {
 
     /// The primary RPC client a write tool reads and submits through.
     ///
-    /// An admitted mainnet write uses the client of its mainnet context. Every
-    /// other route uses the profile's own client; on a mainnet profile without
-    /// admission, [`Self::probe_write_endpoint`] refuses that client with
-    /// `network.mainnet_write_forbidden` once the endpoint reports the mainnet
-    /// passphrase, before any read, so the refusal stays a tool result.
+    /// In builds without `mainnet-write`, the four classic prepares refuse a
+    /// mainnet profile at entry, before client construction or endpoint requests.
+    /// An admitted mainnet write uses the client of its mainnet context. Other
+    /// routes reaching this helper use the profile's client. Without admission,
+    /// [`Self::probe_write_endpoint`] refuses that client with
+    /// `network.mainnet_write_forbidden` when its endpoint reports mainnet,
+    /// before action reads. Both refusals are tool results.
     pub(crate) fn write_primary_client(
         &self,
     ) -> Result<stellar_agent_network::StellarRpcClient, stellar_agent_core::WalletError> {

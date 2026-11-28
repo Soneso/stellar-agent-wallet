@@ -389,8 +389,10 @@ pub(crate) fn submit_timeout(profile: &Profile) -> std::time::Duration {
 /// Asks the RPC endpoint which network it serves and which protocol it runs,
 /// and requires the network to be the profile's.
 ///
-/// The classic prepare and commit tools run this on their client before the
-/// first read on it. The fee, the sequence, the claim entry, and the account
+/// After entry admission, classic prepare and commit tools run this on their
+/// client before its first read. Without `mainnet-write`, classic prepares
+/// refuse a mainnet profile before reaching this probe. The fee, the sequence,
+/// the claim entry, and the account
 /// views they read feed the envelope that is signed or the policy gate, so an
 /// endpoint serving a different network answers none of them. A commit tool's
 /// client is also the one it submits with. Refusing there consumes no nonce,
