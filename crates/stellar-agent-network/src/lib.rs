@@ -71,6 +71,7 @@ mod muxed_destination_tests;
 pub mod redact;
 pub mod retry;
 pub mod rpc_endpoint;
+pub mod sac_payment;
 pub mod sep29;
 pub mod sep41;
 pub mod sequence_floor;
