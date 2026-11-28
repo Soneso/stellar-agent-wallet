@@ -1203,7 +1203,7 @@ A Stellar signature commits to a network: the SEP-23 `TransactionSignaturePayloa
 6. Every decorated signature is verified under the network id the endpoint reported.
 7. `sendTransaction`, then poll `getTransaction`.
 
-Steps 4 and 5 are two reads ahead of the send, so inside the submit layer every submission makes two round trips before the send. They run under the pre-send budget, `PRE_SEND_BUDGET` (30 s) from the start of the first read, which an earlier send-by instant ends sooner. A read that outlasts the budget refuses with `network.pre_send_timeout`, whose message names the read; nothing is sent. The caller's timeout starts after the pre-send record and bounds the send and the confirmation poll of step 7.
+Steps 4 and 5 are two reads ahead of the send, so inside the submit layer every submission makes two round trips before the send. They run under the pre-send budget, `PRE_SEND_BUDGET` (30 s) from the start of the first read, which an earlier send-by instant ends sooner. A read that exhausts the 30-second budget refuses with `network.pre_send_timeout`, whose message names the read; nothing is sent. On authorized mainnet submission, an earlier signed send-by deadline ends the budget with `network.mainnet_authorization_refused`. The caller's timeout starts after the pre-send record and bounds the send and the confirmation poll of step 7.
 
 ### Authorized signing and submission
 
@@ -1525,7 +1525,7 @@ share a 15-second attempt deadline. Transport read failures retry up to three
 attempts, seven seconds apart. Disagreements, identity or credential refusals,
 invalid answers, and elapsed deadlines never retry.
 The MCP dispatch gate reconciles reservations on a client of its own.
-On the CLI, reconciliation uses the primary client.
+On the CLI, testnet reservation reconciliation uses the primary client. Mainnet outcome recovery uses the primary client and the settlement oracle.
 
 On mainnet a settlement step, meaning the reconcile pass, the recovery stage,
 a release, an operator clear or any terminal decision, runs only after
@@ -1631,7 +1631,7 @@ Warnings for unexpected SEP-29 `config.memo_required` values report the value le
 A skipped or not-required outcome makes no oracle comparison of any kind.
 With an oracle configured, a memo-less payment requires a comparison even below
 threshold. Mainnet missing asset thresholds refuse before this memo rule.
-Reservation reconciliation reads the primary alone.
+Testnet reservation reconciliation reads the primary alone. The legacy reconciliation pass sends no chain request for a mainnet reservation. Mainnet outcome recovery uses checked evidence from the primary RPC and settlement oracle through the committed recovery driver. Accounting expiry remains a separate step.
 
 ### Classic fee cap
 
@@ -1721,7 +1721,7 @@ decode errors. Close-time validation after the loop names no attempt count.
 A close-time lag refusal names the ledger and its lag. A host clock that
 cannot be read refuses with `wallet.clock_error` instead.
 
-On MCP and on the CLI mainnet path, the account read that follows the check runs under the same absolute deadline. For CLI mainnet `pay` and `claim`, this is the fresh deadline after `classic_start`. A read still running at that deadline refuses with `network.endpoint_not_ready`. On MCP, the sequence catch-up after a confirmed submit ends its wait at that deadline and keeps the last account it read. The account read follows the check on the same client. So the sequence the envelope is signed against is at least as fresh as the ledger the check observed. The MCP prepare result carries that ledger as `operational`. The CLI mainnet summary of a canonical record renders the stored intent and has no ledger line. The summary of an envelope record names that ledger. A stale endpoint therefore refuses before the summary and before the presence ceremony.
+Each classic MCP prepare's source-account reads share the readiness check's absolute deadline. CLI mainnet source-account reads and testnet `claim`'s source-account read also use the readiness deadline. For CLI mainnet `pay` and `claim`, this is the fresh deadline after `classic_start`. A read still running at that deadline refuses with `network.endpoint_not_ready`. On MCP prepares, the sequence catch-up after a confirmed submit ends its wait at that deadline and keeps the last account it read. Each mainnet canonical rebuild also shares a fresh deadline between readiness and its source-account read. The account read follows the check on the same client. So the sequence the envelope is signed against is at least as fresh as the ledger the check observed. The MCP prepare result carries that ledger as `operational`. The CLI mainnet summary of a canonical record renders the stored intent and has no ledger line. The summary of an envelope record names that ledger. A stale endpoint therefore refuses before the summary and before the presence ceremony.
 
 Each CLI mainnet verb acquires the audit writer in its build, before the summary. A writer another process holds therefore refuses with its own code before the operator is asked to confirm. The build drops only the handle the acquisition returns. The writer registry keeps the writer and its lock held through the presence ceremony.
 
@@ -1774,7 +1774,11 @@ The confirmation poll asks `getTransaction` every 2 s under the send deadline. N
 
 With a submission recorder present, a timeout, poll failure, unexpected status, or uncertain send returns `submission.tx_timeout`. Each retains the receipt, pending audit row, and potential spending. A reported rejection or on-chain failure also retains accounting; no endpoint supplies definitive failure authority. Success stores the reported chain time separately from its first local observation. Bounded exposure counts through the later of that observation and the signed deadline, plus each admitted window. Untimed exposure stays reserved until an explicit recorded acknowledgement.
 
-A standalone identity check, the one a command or tool runs before its first read, runs under its own deadline. On CLI `pay`, `claim`, sponsored `accounts create`, and `trustline`, the identity check and each readiness check get a fresh `PRE_SEND_BUDGET` from their start, and so do the resolver probes of their mainnet writes. The MCP prepares of the four classic value tools run the probe, the readiness check and the account reads under one budget from the start of the call, and each MCP commit's probe and resolver probe get their own. A readiness check that outlasts its budget keeps `network.endpoint_not_ready`. `pool init` keeps `--timeout-seconds` for its check. On those four actions `--timeout-seconds` and the profile's `submit_timeout_seconds` bound only the send and the confirmation poll, and the CLI flag falls back to the profile setting, then 60 s. Inside a submission, the identity check runs under the submission's pre-send budget.
+A standalone identity check, the one a command or tool runs before its first read, runs under its own deadline. On CLI `pay`, `claim`, sponsored `accounts create`, and `trustline`, the identity check and each readiness check get a fresh `PRE_SEND_BUDGET` from their start. Their mainnet resolver probes also get fresh budgets. A standalone command or tool probe timeout returns `network.endpoint_identity_unavailable`; a mainnet authorization resolver probe timeout returns `network.mainnet_authorization_refused`. A readiness check or account read that exceeds its readiness deadline returns `network.endpoint_not_ready`.
+
+Each classic MCP prepare shares one 30-second deadline between its probe, readiness check, and source-account reads with sequence catch-up. Payment starts it at call entry; create-account, claim, and trustline start it just before the probe. Payment's destination and memo reads, claim's balance-entry and separate trustline reads, trustline's issuer read, and every prepare's fee selection are outside that deadline. Trustline's requested source trustline shares the source-account deadline. Each commit's entry probe gets a fresh budget; its source sequence catch-up and other ledger reads do not share that deadline. Each mainnet canonical rebuild gets another readiness deadline for readiness and its source-account read. A matching mainnet balance-floor rule gets its own deadline for readiness and its operating-account read. There is no single timer for all work before signing.
+
+Inside submission, identity and signer-set reads share a fresh 30-second pre-send budget. Exhaustion returns `network.pre_send_timeout` before any send. On authorized mainnet submission, an earlier signed send-by deadline ends that budget first with `network.mainnet_authorization_refused`. `pool init` keeps `--timeout-seconds` for its check. On the four classic actions, `--timeout-seconds` and the profile's `submit_timeout_seconds` bound only send and confirmation; the CLI flag falls back to the profile setting, then 60 s.
 
 The wallet has no automatic failover: the secondary and oracle endpoints verify reads and never send a transaction. It has no circuit breaker either, because the CLI runs one command per process.
 

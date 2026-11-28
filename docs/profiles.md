@@ -298,7 +298,7 @@ message signing on every chain refuses a binding to another profile or chain.
 | `[cross_check_thresholds]` | table | no | empty | Asset thresholds; testnet-only overlay. |
 | `classic_fee_per_op_stroops` | integer | no | unset (`100`) | Per-operation fee, in stroops, when no fee is passed. MCP `stellar_pay`, `stellar_create_account`, and `stellar_trustline` use it without a `fee` argument. MCP `stellar_claim` takes no `fee` argument and always uses it. CLI `trustline` uses it without `--fee`, and `pool init` uses it. CLI `pay`, `claim`, sponsored `accounts create`, and `accounts deploy-c` do not read it and use their command default of 100. When unset, the readers use 100. |
 | `classic_max_fee_per_op_stroops` | integer | mainnet, at action time | unset (no cap) | Per-operation fee cap, in stroops; see below. |
-| `submit_timeout_seconds` | integer | no | `60` | How long the wallet waits for the send and the confirmation poll. CLI `pay`, `claim`, sponsored `accounts create`, and `trustline` use it without `--timeout-seconds`. The endpoint checks and the reads before the send run under a fixed 30-second pre-send budget instead. |
+| `submit_timeout_seconds` | integer | no | `60` | How long the wallet waits for the send and the confirmation poll. CLI `pay`, `claim`, sponsored `accounts create`, and `trustline` use it without `--timeout-seconds`. Each CLI endpoint identity check and readiness check gets its own 30-second budget. The submit layer's identity probe and signer-set read share a separate 30-second budget. On mainnet, an earlier signed send-by deadline ends that submission budget with `network.mainnet_authorization_refused`. |
 
 CLI `pay` and `claim` check the cap in the full pipeline, `--build-only`,
 `--sign-only`, and `--submit-only`. MCP pay, create-account, trustline, and
@@ -475,12 +475,13 @@ A mainnet profile requires `providers.oracle`, a host distinct from `rpc_url`,
 and a `[providers.primary]` record. Endpoint validation and URL redaction apply.
 `providers.oracle` can name a keyring credential for the endpoint.
 
-On mainnet the oracle also witnesses reconciliation, once it reports the
-mainnet passphrase. A submission the primary endpoint reports failed, refused,
-or unknown is checked against the oracle's answers: its transaction status, and
-for an unknown transaction its retention window, ledger close time and account
-sequence. The oracle's success is recorded as a report, and its failure or
-absence keeps the spending-window reservation. Mainnet reconciliation runs
+Mainnet outcome recovery for authenticated classic attempts uses checked
+evidence from the primary RPC and settlement oracle through the committed
+recovery driver. The legacy reservation reconciliation pass sends no chain
+request on mainnet and keeps unexpired reservations pending. For an unmanaged
+record, transaction status queries only the primary; its answer does not
+settle the reservation. Testnet reservation reconciliation reads the primary
+alone. Mainnet reconciliation runs
 only after the enablement verifies, with the primary and oracle the signed
 policy binds. A profile whose `rpc_url` or `oracle_provider_url` was removed
 or moved to another host runs no reconciliation. `tx status`, `tx receipt

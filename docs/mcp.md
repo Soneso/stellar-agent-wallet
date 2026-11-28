@@ -698,7 +698,9 @@ mainnet context. One reporting a different network than the profile declares
 is refused with `network.endpoint_network_mismatch`. One whose
 identity cannot be established is refused with
 `network.endpoint_identity_unavailable`, and one that does not answer within
-the 30-second pre-send budget with `network.pre_send_timeout`. One that answers
+the 30-second pre-send budget with `network.pre_send_timeout`. On authorized
+mainnet submission, an earlier signed send-by deadline ends that budget first
+with `network.mainnet_authorization_refused`. One that answers
 the identity request with HTTP 401 or 403 is refused with
 `network.rpc_credential_refused`. The probe is retried with bounded exponential
 backoff inside the pre-send budget and never falls back to the declaration; an
@@ -706,10 +708,35 @@ answer that does not parse, and a 401 or 403 answer, is not retried. Every
 classic prepare then checks, on the same client and before it reads the account
 it signs against, that the endpoint reports a healthy status and that its
 latest ledger closed within 60 seconds of the host clock; a failed check is
-refused with `network.endpoint_not_ready`. The classic prepares and commits run
-the probe, the readiness check and the reads before the send under the
-pre-send budget, and the profile's `submit_timeout_seconds` bounds only the
-send and the confirmation poll.
+refused with `network.endpoint_not_ready`.
+
+Each classic prepare shares one 30-second deadline between its identity probe,
+readiness check, and source-account reads with sequence catch-up. Payment starts
+that deadline at call entry; create-account, claim, and trustline start it just
+before their probe. The following reads are outside that deadline:
+
+| Prepare | Reads outside the shared deadline |
+| --- | --- |
+| `stellar_pay` | Destination account, fee selection, and SEP-29 memo requirement. |
+| `stellar_create_account` | Fee selection. |
+| `stellar_claim` | Claimable-balance entry, fee selection, and separate source trustline check. |
+| `stellar_trustline` | Issuer account and fee selection. The source's requested trustline shares the source-account deadline. |
+
+Each classic commit's entry probe gets its own 30-second budget. The source
+sequence catch-up and other ledger reads do not share that probe's deadline.
+Each mainnet canonical rebuild gets a separate readiness deadline for its
+readiness check and source-account read. A matching mainnet balance-floor rule
+also gets its own deadline for readiness and its operating-account read.
+The mainnet authorization resolver's probe gets another 30-second budget.
+Submission then shares a fresh pre-send budget between identity and signer-set
+reads. The profile's `submit_timeout_seconds` bounds only send and confirmation.
+
+A standalone prepare or commit probe timeout returns
+`network.endpoint_identity_unavailable`. A readiness check or source-account
+read that exceeds its readiness deadline returns `network.endpoint_not_ready`.
+A mainnet authorization resolver probe timeout returns
+`network.mainnet_authorization_refused`. These checks have no overall timer
+covering every read before signing.
 [Retries, deadlines, and failover](maintainers/security-internals.md#retries-deadlines-and-failover)
 gives the numbers. This release supports protocol versions 29 and 30. On testnet and
 other networks, a version outside that range is logged as a warning. On mainnet
@@ -896,7 +923,7 @@ it, such as a commit preflight before signing. MCP balance reads do not acquire
 it. Under V1, payment simulations can reconcile overdue reservations, acquire
 the writer, and deliver owed accounting events.
 
-The registry normally caches the writer and holds its lock until process exit. A replaced-file refusal during acquisition marks the cached writer for eviction. After callers release it, the next acquisition drops it and checks the file at the path against the anchor. When the server exits, it drains the outbox of every keyed writer it still caches. It exits on client EOF, on SIGINT or SIGTERM on Unix, and on Ctrl-C, Ctrl-Break, or console close on Windows. A queued operator row then reaches the log at shutdown; a refused drain leaves it queued and is logged. The drain waits at most two seconds for each cached writer's mutex. The bound covers the mutex wait only, not the drain's filesystem and keyring work. A writer still held after two seconds is logged with its profile, and its rows stay queued for the next draining writer. A second shutdown signal or console event during the shutdown wait or the drain ends the process at once with exit code 3. Rows the drain did not deliver stay queued, as after a crash. The next draining writer appends them in order with their original timestamps.
+The registry normally caches the writer and holds its lock until process exit. A replaced-file refusal during acquisition marks the cached writer for eviction. After callers release it, the next acquisition drops it and checks the file at the path against the anchor. When the server exits, it drains the outbox of every cached keyed writer except those marked for eviction. It exits on client EOF, on SIGINT or SIGTERM on Unix, and on Ctrl-C, Ctrl-Break, or console close on Windows. A queued operator row then reaches the log at shutdown; a refused drain leaves it queued and is logged. The drain waits at most two seconds for each cached writer's mutex. The bound covers the mutex wait only, not the drain's filesystem and keyring work. A writer still held after two seconds is logged with its profile, and its rows stay queued for the next draining writer. A second shutdown signal or console event during the shutdown wait or the drain ends the process at once with exit code 3. Rows the drain did not deliver stay queued, as after a crash. The next draining writer appends them in order with their original timestamps.
 
 A log restored from an older copy, truncated, or substituted refuses with
 `audit.tip_anchor_mismatch`. Both in-place overwrites and replacements by
@@ -1008,7 +1035,7 @@ envelope.
 | `stellar_claim_commit` | Recheck record, witness, sign, submit. A mainnet commit of an intent stored under `business_id` rebuilds the envelope from that intent without the nonce. | Signs and submits. Two-phase verb; approval spine. |
 | `stellar_balances` | Fetch native XLM balance and optional trustline balances for an account. | Read-only. |
 | `stellar_friendbot` | Fund a testnet account via Friendbot. HTTP 400 containing `already funded` or `createAccountAlreadyExist`, ignoring ASCII case, returns `network.friendbot_account_already_funded`. Check the balance of an account created by an earlier attempt. | Mutating, testnet-only; gated. |
-| `stellar_transaction_status` | Reconcile one submitted transaction against the chain and update the wallet's record of it, by its receipt or, when the receipt is missing, by its reservation. The way out of `submission.tx_timeout`. A reported failure or missing transaction does not release possible spending. Reports `record.release_code` for an accounting disposition such as `submission.accounting_expired`, `record.settlement_evidence: "unavailable"` with an optional `record.settlement_decision_id`, and `reservation` for a hold that remains. On a mainnet profile an authenticated classic attempt reports cached recovery evidence or `UNKNOWN` and sends no additional lookup. For an unmanaged record the primary's `FAILED` and `NOT_FOUND` decide nothing alone; the oracle the enablement binds is asked as well. On mainnet the call reconciles only with the startup enablement record and a fresh check of it, which refuses with `network.mainnet_write_forbidden`; without a record it answers from the stored state and the primary's lookup. | Reads the chain and writes the wallet's record; moves no value and never sends. Not annotated read-only. |
+| `stellar_transaction_status` | Reconcile one submitted transaction against the chain and update the wallet's record of it, by its receipt or, when the receipt is missing, by its reservation. The way out of `submission.tx_timeout`. A reported failure or missing transaction does not release possible spending. Reports `record.release_code` for an accounting disposition such as `submission.accounting_expired`, `record.settlement_evidence: "unavailable"` with an optional `record.settlement_decision_id`, and `reservation` for a hold that remains. On a mainnet profile an authenticated classic attempt reports cached recovery evidence or `UNKNOWN` and sends no additional lookup. An unmanaged mainnet record gets only a primary status lookup, with no oracle lookup; its answer does not settle the reservation. The legacy reconciliation pass keeps unexpired mainnet reservations pending without a chain request. On mainnet the call reconciles only with the startup enablement record and a fresh check of it, which refuses with `network.mainnet_write_forbidden`; without a record it answers from the stored state and the primary's lookup. | Reads the chain and writes the wallet's record; moves no value and never sends. Not annotated read-only. |
 
 `stellar_claim_commit` witnesses the source account and complete fresh
 claimable-balance record. It does not re-read the source trustline at commit.

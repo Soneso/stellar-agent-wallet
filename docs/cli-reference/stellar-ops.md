@@ -106,7 +106,18 @@ Several flags recur across the commands on this page with the same meaning. Thei
 - `--rpc-url <URL>`: optional testnet endpoint override; mainnet profiles refuse its presence. Without it, the profile endpoint applies. Credentials are refused. An overriding URL gets the keyring credential only when it equals the profile's `rpc_url`.
 - `--output <FORMAT>`: `json` (default) or `table`.
 - `--business-id <ID>`: names one value operation on `pay`, `claim`, `trustline` and `accounts create`. Required on mainnet; see [Mainnet actions](#mainnet-actions).
-- `--timeout-seconds <SECONDS>`: bounds submission. On sponsored `accounts create`, `pay`, `claim`, and `trustline`, it bounds the send and the confirmation poll, and the [endpoint checks](index.md#endpoint-identity-before-the-first-read) and the reads before the send run under a fixed 30-second pre-send budget. Default: the profile's `submit_timeout_seconds` on those four commands, then `60`.
+- `--timeout-seconds <SECONDS>`: bounds submission. On sponsored `accounts create`, `pay`, `claim`, and `trustline`, it bounds the send and the confirmation poll. Default: the profile's `submit_timeout_seconds` on those four commands, then `60`.
+
+  On those four classic value commands, each CLI endpoint identity check and each readiness check gets its own 30-second budget. The submit layer starts a separate 30-second budget shared by its endpoint identity probe and signer-set read. Source-account reads that use the readiness deadline share that check's budget. These budgets do not cover every read before signing. On mainnet, an earlier signed send-by deadline ends the submit layer's budget first and returns `network.mainnet_authorization_refused`.
+
+  For those four classic value verbs, `network.pre_send_timeout` means no transaction is sent.
+  A send timeout can leave a transaction that succeeds later.
+  `--timeout-seconds 1` can return `submission.tx_timeout` even when the transaction succeeds.
+  Check recovery with [`stellar-agent tx status <HASH>`](#stellar-agent-tx-status-hash-flags).
+  Mainnet recovery requires checked evidence from the primary RPC (`rpc_url`) and the settlement oracle (`oracle_provider_url`).
+  `secondary_rpc_url` names a separate endpoint role.
+  A `NOT_FOUND` answer alone neither allows a retry nor releases the spending reservation.
+
 - Signer source: `--secret-env <VAR>` / `--deployer-secret-env <VAR>` (an env-var name, never the secret) or `--sign-with-ledger`, with `--account-index <INDEX>` for the Ledger derivation path (default `0`).
 - `--fee <STROOPS|auto[:pNN]>`: the classic per-operation fee. An integer sets
   an explicit stroop value; `auto` selects the p95 percentile from
@@ -518,7 +529,7 @@ stellar-agent balances \
 Creates or removes a classic trustline (`ChangeTrust`) behind an ordered trust gate. The steps run in this order: denomination resolution (USDT hard-refusal, a known-lookalike denylist, and pinned-issuer checks), the endpoint checks, a live issuer-flag fetch that fail-closes on error, and the source-account read. Fee resolution and the unsigned envelope build follow, then operator policy evaluation, the audit pre-flight, and the clawback gate with its typed preview. The witness, signing, and submission come last.
 
 - Signing: Signs via the profile's keyring signer; builds, signs, submits, and waits atomically. There is no staged pipeline.
-- Timeout: `--timeout-seconds`, else the profile's `submit_timeout_seconds`, else 60 seconds, bounds the send and the confirmation poll. The endpoint checks ahead of the issuer read and the submit layer's reads before the send each run under a fixed 30-second pre-send budget.
+- Timeout: `--timeout-seconds`, else the profile's `submit_timeout_seconds`, else 60 seconds, bounds the send and the confirmation poll. Each CLI endpoint identity check and readiness check gets its own 30-second budget. The submit layer's identity probe and signer-set read share a separate 30-second budget. On mainnet, an earlier signed send-by deadline ends that submission budget with `network.mainnet_authorization_refused`.
 - Network: Derived from the loaded profile (`rpc_url`, `network_passphrase`, `chain_id`). The profile file supplies the chain identity. There is no `--network` flag: the network comes from the profile configuration. The command goes through the same submit layer as every other verb, so it gets the same binding. The endpoint is asked which network it serves and that answer is authoritative. The envelope's signatures are verified against it. Default builds enable the `mainnet-write` feature, and builds with `--no-default-features` omit it. These builds admit configured mainnet trustline actions through authorized signing and submission. With the feature off, a mainnet profile refuses with `network.mainnet_write_forbidden` before the keyring store, the signer, and any RPC request. See [Submit-layer network binding](index.md#submit-layer-network-binding) for the wire codes.
 - USDT is hard-refused: The denomination resolver rejects USDT outright; the command cannot create a USDT trustline.
 - Limit: `--limit-stroops 0` removes the trustline. When absent the Stellar default (`i64::MAX`, unlimited) applies.

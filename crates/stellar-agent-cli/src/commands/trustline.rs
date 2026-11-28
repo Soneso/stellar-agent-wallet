@@ -716,14 +716,7 @@ where
     // spending-window reservation before the bytes leave. It records a
     // reported success on the receipt and in the reservation, and every other
     // answer leaves all three standing.
-    let submission_failure = |e: WalletError| {
-        crate::commands::submission_record::error_envelope_with_fallback(
-            &e,
-            &signed_xdr,
-            "trustline",
-            "trustline.submit_failed",
-        )
-    };
+    let submission_failure = |e: WalletError| trustline_submission_error(&e, &signed_xdr);
     let recorder = crate::commands::submission_record::build_recorder(
         crate::commands::submission_record::SubmitRecord {
             unvalued: None,
@@ -777,6 +770,23 @@ where
         cross_check: Some(cross_check.view()),
         business_id: args.business_id.clone(),
     })
+}
+
+/// Preserves the no-send timeout envelope so callers can distinguish it from
+/// an unknown submission outcome.
+fn trustline_submission_error(error: &WalletError, signed_xdr: &str) -> Envelope<()> {
+    if matches!(
+        error,
+        WalletError::Network(NetworkError::PreSendTimeout { .. })
+    ) {
+        return crate::commands::submission_record::error_envelope(error, signed_xdr, "trustline");
+    }
+    crate::commands::submission_record::error_envelope_with_fallback(
+        error,
+        signed_xdr,
+        "trustline",
+        "trustline.submit_failed",
+    )
 }
 
 /// A built, unsigned `ChangeTrust` envelope and the fee it pays.
@@ -1614,6 +1624,28 @@ pub(crate) mod tests {
     )]
 
     use super::*;
+
+    #[test]
+    fn pre_send_timeout_preserves_classic_value_envelope() {
+        let error = WalletError::Network(NetworkError::PreSendTimeout {
+            read: "signer-set read".to_owned(),
+            budget_secs: 30,
+        });
+        let envelope = trustline_submission_error(&error, "");
+        let detail = envelope.error.as_ref().unwrap();
+        assert_eq!(detail.code, "network.pre_send_timeout");
+        assert!(detail.details.is_none());
+        for verb in ["pay", "claim", "accounts create"] {
+            let mut expected = crate::commands::submission_record::error_envelope(&error, "", verb);
+            // Each envelope gets a fresh correlation ID.
+            expected.request_id.clone_from(&envelope.request_id);
+            assert_eq!(
+                serde_json::to_value(&envelope).unwrap(),
+                serde_json::to_value(expected).unwrap(),
+                "trustline must preserve the same envelope as {verb}"
+            );
+        }
+    }
 
     // ── attestation-key read is fail-closed ───────────────────────────────────
 

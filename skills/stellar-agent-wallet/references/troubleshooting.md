@@ -542,6 +542,20 @@ again.
 | `submission.tx_malformed` | The endpoint refused the transaction outright, reporting a validation error for the envelope (for example the fee was below the current floor). The wallet never sends those bytes again. A reported failure or missing transaction does not release possible spending: the record stays `pending`. The reservation keeps counting through its accounting horizon or, without a time bound, until the operator clears it with both acknowledgement flags. On a mainnet profile a refusal is reported as `submission.tx_timeout` instead, because no second endpoint confirms it. | The error carries no `details` object. Report it to the operator. Once the accounting horizon has passed or the operator has cleared the record, a fresh attempt must still pass the spending window's duplicate and cap checks. Do not resubmit the same bytes. |
 | `policy.approval_consumed` | The approval presented was already spent. A classic approval was spent on a submission. A `stellar_sep43_sign_transaction` approval is spent when the signature is returned, and the caller holds that signature. A consumed x402 approval cannot be replayed. Its stored digest identifies the final envelope on mainnet or signed authorization entries on testnet. It is not a chain transaction hash. On mainnet the code also answers a proof of another operation, such as a call under another `business_id`. | Do not re-present the same approval. For another operation, present it only under the `business_id` of the call that prepared it. For a classic approval, check that transaction's status before asking for the action again. For an x402 payment, request a new payment intent with call 1 and a fresh approval. |
 
+For `pay`, `claim`, sponsored `accounts create`, and `trustline`, `--timeout-seconds` bounds the send and the confirmation poll.
+Each CLI endpoint identity check and each readiness check gets its own 30-second budget.
+The submit layer starts a separate 30-second budget shared by its endpoint identity probe and signer-set read.
+Source-account reads that use the readiness deadline share that check's budget.
+These budgets do not cover every read before signing.
+On mainnet, an earlier signed send-by deadline ends the submit layer's budget first and returns `network.mainnet_authorization_refused`.
+`network.pre_send_timeout` means no transaction is sent.
+A send timeout can leave a transaction that succeeds later.
+`--timeout-seconds 1` can return `submission.tx_timeout` even when the transaction succeeds.
+Check recovery with [`stellar-agent tx status <HASH>`](cli-reference.md#tx-status-hash-flags) or the MCP tool `stellar_transaction_status`.
+Mainnet recovery requires checked evidence from the primary RPC (`rpc_url`) and the settlement oracle (`oracle_provider_url`).
+`secondary_rpc_url` names a separate endpoint role.
+A `NOT_FOUND` answer alone neither allows a retry nor releases the spending reservation.
+
 What `stellar_transaction_status` reports, and what it means:
 
 A reported failure or missing transaction does not release possible spending.
@@ -566,8 +580,9 @@ A reported failure or missing transaction does not release possible spending.
   recovery decision settles it once this host's clock is at least six seconds
   past the envelope's maxTime. The decision needs identical answers from the
   primary endpoint and the oracle, and the profile's audit writer. An unmanaged
-  record keeps its primary lookup; that answer's `FAILED` or `NOT_FOUND` decides
-  nothing alone, and the oracle the enablement binds is asked as well.
+  record gets only a primary status lookup, with no oracle lookup. That answer
+  does not settle its mainnet reservation; the legacy reconciliation pass keeps
+  unexpired mainnet reservations pending without a chain request.
   Reconciliation runs only after the
   enablement verifies: a stored `rpc_url` or `oracle_provider_url` removed or
   moved to another host refuses with `profile.mainnet_enablement_invalid`
